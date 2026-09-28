@@ -4,11 +4,9 @@ import math
 import logging
 from typing import List, Dict, Optional, Union
 
-from config import (
-    ModelConfig, CHANNEL_MEAN, CHANNEL_STD, SELECTED_CLASSES,
-    get_class_names, get_class_names_en, get_class_remap
-)
+from datasets.dataset import NUM_TARGET_CLASSES, TARGET_CLASS_NAMES
 from model import create_model
+import segmentation_models_pytorch as smp
 
 logger = logging.getLogger(__name__)
 
@@ -16,85 +14,58 @@ logger = logging.getLogger(__name__)
 class SegmentationModel:
     """
     Класс для выполнения логического вывода (инференса) модели сегментации.
-
-    Обеспечивает загрузку весов, предобработку входных изображений (включая
-    тайлинг для изображений произвольного размера), выполнение предсказания
-    и объединение результатов.
-
-    Формат входных данных: изображения в виде np.ndarray, форма (H, W, 5)
-    или (5, H, W).
-    Формат выходных данных: маски в виде np.ndarray, форма (H, W),
-    dtype uint8 (непрерывные индексы классов).
     """
 
     def __init__(
         self,
         checkpoint_path: str,
         device: str = 'cuda',
-        selected_classes: Optional[List[int]] = None
     ) -> None:
         """
         Инициализация модели сегментации.
-
-        Args:
-            checkpoint_path: Путь к файлу чекпоинта (.pth).
-            device: Устройство для вычислений ('cuda' или 'cpu').
-            selected_classes: Список выбранных классов. Если None,
-                              используется значение из конфигурации.
         """
         self.device = torch.device(device)
-        self.selected_classes = selected_classes if selected_classes is not None else SELECTED_CLASSES
-        self.num_classes = len(self.selected_classes) + 1
+        self.num_classes = NUM_TARGET_CLASSES
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
-        # Если в чекпоинте сохранен конфиг, можно его извлечь
-        model_config_dict = checkpoint.get('model_config', {})
-        if isinstance(model_config_dict, ModelConfig):
-            self.model_config = model_config_dict
-        else:
-            self.model_config = ModelConfig(**model_config_dict) if model_config_dict else ModelConfig()
-
-        self.model = create_model(self.model_config).to(self.device)
+        self.model = create_model(
+            architecture='UnetPlusPlus',
+            encoder_name='tu-maxvit_base_tf_512',
+            in_channels=3,
+            num_classes=self.num_classes
+        ).to(self.device)
         
-        # Поддержка разных форматов сохранения чекпоинта
         state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
         self.model.load_state_dict(state_dict)
         
         self.model.eval()
 
-        self.mean = np.array(CHANNEL_MEAN, dtype=np.float32)
-        self.std = np.array(CHANNEL_STD, dtype=np.float32)
+        preprocess_params = smp.encoders.get_preprocessing_params('tu-maxvit_base_tf_512')
+        self.mean = np.array(preprocess_params['mean'], dtype=np.float32)
+        self.std = np.array(preprocess_params['std'], dtype=np.float32)
         
         logger.info(f"Модель успешно загружена из {checkpoint_path} на {self.device}")
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
         """
         Предобработка изображения: приведение осей, нормализация.
-
-        Args:
-            image: Входное изображение (H, W, 5) или (5, H, W).
-
-        Returns:
-            Нормализованное изображение формы (5, H, W), dtype float32.
         """
         if image.ndim != 3:
             raise ValueError(f"Ожидается трехмерный массив, получено {image.ndim} измерений")
 
-        # Приведение к формату (C, H, W)
-        if image.shape[2] == 5:
+        if image.shape[2] == 3:
             image = np.transpose(image, (2, 0, 1))
-        elif image.shape[0] != 5:
-            raise ValueError(f"Ожидается 5 спектральных каналов, получена форма {image.shape}")
+        elif image.shape[0] != 3:
+            raise ValueError(f"Ожидается 3 спектральных каналов, получена форма {image.shape}")
 
         if image.dtype != np.float32:
             image = image.astype(np.float32)
 
-        # Нормализация
         if image.max() > 1.0:
             image /= 255.0
 
-        for i in range(5):
+        for i in range(3):
             image[i] = (image[i] - self.mean[i]) / self.std[i]
 
         return image
@@ -102,15 +73,6 @@ class SegmentationModel:
     def predict_proba(self, image: np.ndarray) -> np.ndarray:
         """
         Предсказание вероятностей классов для изображения произвольного размера.
-
-        Изображение нарезается на тайлы 512x512 с перекрытием 64 пикселя.
-        Результаты усредняются в зонах перекрытия.
-
-        Args:
-            image: Входное изображение (H, W, 5) или (5, H, W).
-
-        Returns:
-            Массив вероятностей формы (num_classes, H, W), dtype float32.
         """
         image_proc = self._preprocess(image)
         c, h, w = image_proc.shape
@@ -133,10 +95,8 @@ class SegmentationModel:
         y_steps = range(0, padded_h - tile_size + 1, stride) if padded_h >= tile_size else [0]
         x_steps = range(0, padded_w - tile_size + 1, stride) if padded_w >= tile_size else [0]
         
-        # Если размер меньше размера тайла (что редкость, но возможно)
         if padded_h < tile_size or padded_w < tile_size:
             y_steps, x_steps = [0], [0]
-            # Дополнительный паддинг до размера тайла
             target_h = max(tile_size, padded_h)
             target_w = max(tile_size, padded_w)
             image_proc = np.pad(image_proc, ((0, 0), (0, target_h - padded_h), (0, target_w - padded_w)), mode='reflect')
@@ -163,12 +123,6 @@ class SegmentationModel:
     def predict(self, image: np.ndarray) -> np.ndarray:
         """
         Предсказание маски сегментации для изображения.
-
-        Args:
-            image: Входное изображение (H, W, 5) или (5, H, W).
-
-        Returns:
-            Маска индексов классов формы (H, W), dtype uint8.
         """
         probs = self.predict_proba(image)
         mask = np.argmax(probs, axis=0).astype(np.uint8)
@@ -177,29 +131,11 @@ class SegmentationModel:
     def predict_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
         """
         Пакетная обработка списка изображений.
-
-        Args:
-            images: Список изображений.
-
-        Returns:
-            Список предсказанных масок.
         """
         return [self.predict(img) for img in images]
 
     def get_class_names(self) -> Dict[int, str]:
         """
-        Получение словаря имен классов на русском языке.
-
-        Returns:
-            Словарь вида {индекс_класса: "Название RU"}.
+        Получение словаря имен классов.
         """
-        return get_class_names()
-
-    def get_class_names_en(self) -> Dict[int, str]:
-        """
-        Получение словаря имен классов на английском языке.
-
-        Returns:
-            Словарь вида {индекс_класса: "Название EN"}.
-        """
-        return get_class_names_en()
+        return TARGET_CLASS_NAMES

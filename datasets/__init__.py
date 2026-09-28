@@ -3,8 +3,7 @@
 для задачи семантической сегментации.
 
 Модули:
-    - forest_dataset: классы датасетов (OptINSInstaSeg, PotsdamData, BAMFORESTS,
-      ChesapeakeData), функция prepare_forest_water_datasets
-      и collate-функция forest_collate_fn.
+    - dataset: классы датасетов (DeepGlobeData, LandCoverAIData, GIDData, WHUOptSarData, DODWData),
+      функция prepare_datasets и collate-функция segmentation_collate_fn.
     - semantic_sync_transforms: синхронные аугментации (SyncCompose и др.).
 """

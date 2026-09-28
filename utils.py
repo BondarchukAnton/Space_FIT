@@ -7,20 +7,38 @@
 
 import logging
 from typing import Dict, List, Optional, Tuple
-
+import random
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-from config import (
-    get_class_names,
-    get_class_remap,
-    get_selected_colors,
-    SELECTED_CLASSES,
-)
+from datasets.dataset import NUM_TARGET_CLASSES, TARGET_CLASS_NAMES
 
 logger = logging.getLogger(__name__)
+
+TARGET_COLORS = {
+    0: (0, 0, 0),         # Фон
+    1: (34, 139, 34),     # Лесной массив
+    2: (255, 215, 0),     # Поле
+    3: (30, 144, 255),    # Водоём
+    4: (220, 20, 60),     # Городская территория
+    5: (139, 90, 43),     # Горный район
+    6: (169, 169, 169),   # Прочее
+}
+
+
+def n_e_augs_shuffle(augs_list, n=-3, skip_first=False):
+    """
+    Перемешивает первые (или срединные) элементы списка аугментаций.
+    """
+    augs_list = list(augs_list)
+    if len(augs_list) > 3:
+        s = 1 if skip_first else 0
+        first_n = augs_list[s:n]
+        random.shuffle(first_n)
+        augs_list[s:n] = first_n
+    return augs_list
 
 
 # ---------------------------------------------------------------------------
@@ -34,14 +52,6 @@ def compute_confusion_matrix(
 ) -> torch.Tensor:
     """
     Вычисление матрицы ошибок размера (num_classes, num_classes).
-
-    Args:
-        pred: предсказанные индексы классов, shape (N,) или (H, W).
-        target: истинные индексы классов, shape (N,) или (H, W).
-        num_classes: общее число классов.
-
-    Returns:
-        Матрица ошибок (num_classes, num_classes), dtype int64.
     """
     pred = pred.flatten().long()
     target = target.flatten().long()
@@ -58,14 +68,6 @@ def compute_confusion_matrix(
 def compute_iou_from_cm(cm: torch.Tensor) -> Tuple[Dict[int, float], float]:
     """
     Вычисление IoU по классам из матрицы ошибок.
-
-    Args:
-        cm: матрица ошибок (num_classes, num_classes).
-
-    Returns:
-        Кортеж (iou_per_class, mean_iou):
-            - iou_per_class: словарь {индекс класса: IoU}.
-            - mean_iou: среднее IoU по классам с ненулевой площадью.
     """
     intersection = cm.diag()
     union = cm.sum(dim=1) + cm.sum(dim=0) - intersection
@@ -91,74 +93,9 @@ def compute_iou(
 ) -> Tuple[Dict[int, float], float]:
     """
     Вычисление IoU по классам для пары предсказание/истина.
-
-    Args:
-        pred: предсказанные индексы, shape произвольный.
-        target: истинные индексы, shape произвольный.
-        num_classes: общее число классов.
-
-    Returns:
-        Кортеж (iou_per_class, mean_iou).
     """
     cm = compute_confusion_matrix(pred, target, num_classes)
     return compute_iou_from_cm(cm)
-
-
-# ---------------------------------------------------------------------------
-# Ремаппинг масок
-# ---------------------------------------------------------------------------
-_LUT = np.zeros(256, dtype=np.int64)
-for _orig_val, _target_idx in get_class_remap().items():
-    _LUT[_orig_val] = _target_idx
-
-
-def remap_mask(mask: np.ndarray) -> np.ndarray:
-    """
-    Быстрый попиксельный ремаппинг через Look-Up Table (LUT).
-
-    Args:
-        mask: одноканальная маска, dtype uint8.
-
-    Returns:
-        Маска с непрерывными индексами классов (0..5), dtype int64.
-    """
-    return _LUT[mask]
-# def remap_mask(mask: np.ndarray) -> np.ndarray:
-#     """
-#     Ремаппинг пиксельных значений маски в непрерывные индексы.
-#
-#     Пиксели выбранных классов получают индексы 1..N.
-#     Все прочие пиксели (включая фон, значение 0) -> индекс 0.
-#
-#     Args:
-#         mask: одноканальная маска, dtype uint8.
-#
-#     Returns:
-#         Маска с непрерывными индексами классов, dtype int64.
-#     """
-#     remap = get_class_remap()
-#     remapped = np.zeros_like(mask, dtype=np.int64)
-#     for pixel_val, idx in remap.items():
-#         remapped[mask == pixel_val] = idx
-#     return remapped
-
-
-# def inverse_remap_mask(mask: np.ndarray) -> np.ndarray:
-#     """
-#     Обратный ремаппинг: непрерывные индексы -> пиксельные значения.
-#
-#     Args:
-#         mask: маска с непрерывными индексами, dtype int.
-#
-#     Returns:
-#         Маска с пиксельными значениями датасета, dtype uint8.
-#     """
-#     from config import get_inverse_remap
-#     inv_remap = get_inverse_remap()
-#     result = np.zeros_like(mask, dtype=np.uint8)
-#     for idx, pixel_val in inv_remap.items():
-#         result[mask == idx] = pixel_val
-#     return result
 
 
 # ---------------------------------------------------------------------------
@@ -171,17 +108,9 @@ def mask_to_rgb(
 ) -> np.ndarray:
     """
     Преобразование одноканальной маски индексов в RGB-изображение.
-
-    Args:
-        mask: маска с непрерывными индексами классов, shape (H, W).
-        colors: словарь {индекс: (R, G, B)}. По умолчанию — палитра
-                из конфигурации.
-
-    Returns:
-        RGB-изображение, shape (H, W, 3), dtype uint8.
     """
     if colors is None:
-        colors = get_selected_colors()
+        colors = TARGET_COLORS
 
     h, w = mask.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
@@ -195,16 +124,9 @@ def create_legend_patches(
 ) -> List[mpatches.Patch]:
     """
     Формирование элементов легенды для визуализации маски.
-
-    Args:
-        class_indices: список индексов классов для отображения.
-                       По умолчанию — все выбранные классы + фон.
-
-    Returns:
-        Список matplotlib.patches.Patch для добавления в легенду.
     """
-    names = get_class_names()
-    colors = get_selected_colors()
+    names = TARGET_CLASS_NAMES
+    colors = TARGET_COLORS
 
     if class_indices is None:
         class_indices = sorted(colors.keys())
@@ -230,21 +152,6 @@ def visualize_prediction(
 ) -> plt.Figure:
     """
     Визуализация результата сегментации.
-
-    Отображает исходное изображение, маску предсказания
-    и (при наличии) маску ground truth.
-
-    Args:
-        image: исходное изображение, shape (H, W, C) или (C, H, W).
-               Отображаются первые 3 канала (RGB).
-        pred_mask: предсказанная маска, shape (H, W), непрерывные индексы.
-        gt_mask: маска ground truth (опционально), shape (H, W).
-        alpha: прозрачность наложения маски.
-        visible_classes: список классов для отображения. Если None — все.
-        figsize: размер фигуры matplotlib.
-
-    Returns:
-        Объект matplotlib.Figure.
     """
     # Подготовка изображения: извлечение RGB
     if image.ndim == 3 and image.shape[0] <= image.shape[2]:
@@ -316,8 +223,6 @@ def visualize_prediction(
 def setup_logging(level: int = logging.INFO) -> None:
     """
     Настройка формата логирования для всех модулей проекта.
-
-    Формат: [ГГГГ-ММ-ДД ЧЧ:ММ:СС] УРОВЕНЬ имя_модуля — сообщение.
     """
     fmt = "[%(asctime)s] %(levelname)s %(name)s — %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"

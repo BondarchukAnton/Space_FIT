@@ -1,11 +1,11 @@
 import numpy as np
-from datasets.forest_dataset import prepare_forest_water_datasets, forest_collate_fn
+from datasets.dataset import prepare_datasets, segmentation_collate_fn, NUM_TARGET_CLASSES, TARGET_CLASS_NAMES
+import segmentation_models_pytorch as smp
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
-from networks.vit_seg_modeling import VisionTransformer, CONFIGS
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import sys
@@ -45,221 +45,179 @@ def save_checkpoints(epoch, model_state_dict, optimizer_state_dict, mean_loss, e
         'loss': mean_loss,
     }, model_dst)
 
-BATCH_SIZE = 13  # Физический размер батча (при 1024 разрешение, чтобы не было CUDA OOM)
-ACCUMULATION_STEPS = 1  #
+
+BATCH_SIZE = 8  # RTX 5090 (32GB) with MaxViT encoder
+ACCUMULATION_STEPS = 2  # Effective batch size = 16
 WRITER_EPOCH = 1
 start_epoch = 1
-EPOCHS = 20
+EPOCHS = 50
 resolution = 512
-LABEL = 'TransUNet_forest_v6_onlyRGB_512'
-continue_with = None
+LABEL = 'UnetPP_maxvit_7cls_512'
+continue_with = None  # Путь к чекпоинту для продолжения
 
-# !!!!!!!!!!!!!!1
-acc = 0.99
-IoU = 0.99
+train_dataset, val_dataset = prepare_datasets(resolution=resolution, target_m_per_px=10.0)
 
-train_dataset, val_dataset_big, val_dataset_target = prepare_forest_water_datasets(resolution=resolution, chb_mode=False)
-
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4,
-                          persistent_workers=True, pin_memory=True, prefetch_factor=2, collate_fn=forest_collate_fn)  # при 8 оператива забивается
-# val_loader_big = DataLoader(val_dataset_big, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, collate_fn=water_collate_fn)
-val_loader_target = DataLoader(val_dataset_target, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, collate_fn=forest_collate_fn)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+                          num_workers=4, persistent_workers=True, pin_memory=True,
+                          prefetch_factor=2, collate_fn=segmentation_collate_fn)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
+                        collate_fn=segmentation_collate_fn)
 
 print('Количество объектов в обучающей выборке ', len(train_dataset))
-# print('Количество объектов в val_dataset_big ', len(val_dataset_big))
-print('Количество объектов в val_dataset_target ', len(val_dataset_target))
-del train_dataset
-del val_dataset_big
-del val_dataset_target
-
-
-
+print('Количество объектов в валидационной выборке ', len(val_dataset))
 
 iou_metric = MulticlassJaccardIndex(
-    num_classes=2,
+    num_classes=NUM_TARGET_CLASSES,
     average='none',
     ignore_index=None
 ).cpu()
 
 accuracy_metric = MulticlassAccuracy(
-    num_classes=2,
+    num_classes=NUM_TARGET_CLASSES,
     average='micro'
 ).cpu()
 
-# 1. Настройка конфигурации для нашей задачи (3 класса, размер 512)
-config_vit = CONFIGS['R50-ViT-B_16']
-config_vit.n_classes = 2      # 0 - Фон, 1 - объект
-config_vit.n_skip = 3         # U-Net skip connections
-config_vit.patches.grid = (int(resolution / 16), int(resolution / 16)) # Для 1024х1024 сетка будет 64х64
-
-# 2. Создание модели
-model = VisionTransformer(config_vit, img_size=resolution, num_classes=2)
-
-# 3. Загрузка предобученных весов ImageNet21k
-weights_path =  '/home/user/PycharmProjects/OptINS_etap3/Water_Semantic_Seg/imagenet21k_R50+ViT-B_16.npz'
-model.load_from(weights=np.load(weights_path))
-
-# Перенос на видеокарту
+model = smp.UnetPlusPlus(
+    encoder_name='tu-maxvit_base_tf_512',
+    encoder_weights='imagenet',
+    in_channels=3,
+    classes=NUM_TARGET_CLASSES,
+)
 model = model.cuda()
 
-param_dicts = [
-    # Группа 1: Бэкбоун (ResNet)
-    {"params": [p for n, p in model.named_parameters() if "resnet" in n and p.requires_grad]},
+preprocess_params = smp.encoders.get_preprocessing_params('tu-maxvit_base_tf_512')
+ENCODER_MEAN = torch.tensor(preprocess_params['mean'], device='cuda').view(1, 3, 1, 1)
+ENCODER_STD = torch.tensor(preprocess_params['std'], device='cuda').view(1, 3, 1, 1)
 
-    # Группа 2: Всё остальное (Трансформер, Декодер, Голова)
-    {"params": [p for n, p in model.named_parameters() if "resnet" not in n and p.requires_grad]},
+def normalize_tensor(tensor):
+    tensor = tensor.to('cuda')
+    return (tensor - ENCODER_MEAN) / ENCODER_STD
+
+param_dicts = [
+    {"params": [p for n, p in model.named_parameters() if "encoder" in n and p.requires_grad]},
+    {"params": [p for n, p in model.named_parameters() if "encoder" not in n and p.requires_grad]},
 ]
 
-# OneCycleLR сам назначит правильные шаги из списка max_lr
 optimizer = torch.optim.AdamW(param_dicts, weight_decay=1e-4)
 
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
-    max_lr=[1e-5, 1e-4],  # Пиковые значения: [Бэкбоун, Трансформер]
-    steps_per_epoch=len(train_loader) // ACCUMULATION_STEPS,  # Шагов оптимизатора в эпоху (с учётом накопления градиентов)
+    max_lr=[1e-5, 1e-4],  # [encoder, decoder]
+    steps_per_epoch=max(1, len(train_loader) // ACCUMULATION_STEPS),
     epochs=EPOCHS,
-    pct_start=0.1,        # 10% от всего времени обучения тратим на плавный разогрев
-    div_factor=10.0,      # Стартуем с LR в 10 раз меньше пикового
-    final_div_factor=1e4  # В конце спускаемся к микроскопическому значению
+    pct_start=0.1,
+    div_factor=10.0,
+    final_div_factor=1e4
 )
 
-
 class ComboLoss(nn.Module):
-    def __init__(self, weights=None):
+    def __init__(self, num_classes, weights=None):
         super().__init__()
-        import segmentation_models_pytorch as smp
         if weights is None:
             weights = {'dice': 0.5, 'ce': 0.3, 'focal': 0.2}
-
         self.weights = weights
         self.dice_loss = smp.losses.DiceLoss(mode='multiclass', from_logits=True)
         self.ce_loss = nn.CrossEntropyLoss()
         self.focal_loss = smp.losses.FocalLoss(mode='multiclass', alpha=0.25, gamma=2.0)
 
     def forward(self, outputs, targets):
-        """
-        outputs: [B, C, H, W] — логиты от модели
-        targets: [B, C, H, W] — one-hot маска
-        """
-        # Преобразуем one-hot -> индекс классов
-        targets_argmax = targets.argmax(dim=1).long()  # [B, H, W]
-
         loss = 0.0
-
         if self.weights.get('dice', 0) > 0:
-            # DiceLoss ожидает индексную маску при mode='multiclass'
-            loss += self.weights['dice'] * self.dice_loss(outputs, targets_argmax)
-
+            loss += self.weights['dice'] * self.dice_loss(outputs, targets)
         if self.weights.get('ce', 0) > 0:
-            loss += self.weights['ce'] * self.ce_loss(outputs, targets_argmax)
-
+            loss += self.weights['ce'] * self.ce_loss(outputs, targets)
         if self.weights.get('focal', 0) > 0:
-            loss += self.weights['focal'] * self.focal_loss(outputs, targets_argmax)
-
+            loss += self.weights['focal'] * self.focal_loss(outputs, targets)
         return loss
 
-criterion = ComboLoss(weights={'dice': 0.6, 'ce': 0.3, 'focal': 0.1}).cuda()
+criterion = ComboLoss(num_classes=NUM_TARGET_CLASSES, weights={'dice': 0.6, 'ce': 0.3, 'focal': 0.1}).cuda()
+scaler = torch.amp.GradScaler('cuda')
 
 if continue_with:
-    checkpoint = torch.load(continue_with, weights_only=False)
+    checkpoint = torch.load(continue_with, weights_only=False, map_location='cuda')
     model.load_state_dict(checkpoint['model_state_dict'])
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if 'scheduler' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    if 'epoch' in checkpoint:
+        start_epoch = checkpoint['epoch'] + 1
     print('Веса загружены успешно')
 
-logs_root = Path('/mnt/980EAB530EAB2968/hdd_logs/Optins3etap') #'/mnt/16TBvolume1/hdd_logs/Optins3etap')
+logs_root = Path('./runs')
 experiment_dir = logs_root / LABEL
 writer = SummaryWriter(experiment_dir)
 top_acc = 0
 top_mean_loss = 200
-best_val_iou = 0.0
-overall_iou = 0.0
-mean_ious = []
 
-# Определяем параметры нормализации один раз
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], device='cuda').view(1, 3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], device='cuda').view(1, 3, 1, 1)
-
-def normalize_tensor(tensor):
-    """Нормализация тензора на GPU"""
-    tensor = tensor.to('cuda')
-    return (tensor - IMAGENET_MEAN) / IMAGENET_STD
-
+TARGET_COLORS = {
+    0: (0, 0, 0),         # Фон — чёрный
+    1: (34, 139, 34),     # Лесной массив — зелёный
+    2: (255, 215, 0),     # Поле — золотой
+    3: (30, 144, 255),    # Водоём — синий
+    4: (220, 20, 60),     # Городская территория — красный
+    5: (139, 90, 43),     # Горный район — коричневый
+    6: (169, 169, 169),   # Прочее — серый
+}
 
 def build_vis_image(X_vis, y_vis, output_vis, resolution):
-    """Собирает композитное изображение [Img, GT, Pred, Acc] для TensorBoard (один формат для train и val)."""
     row_N = X_vis.shape[0]
-
-    # 2. Цветовая маска GT
-    ancmsk = y_vis.argmax(1)
-    anc_mask = torch.zeros(row_N, 3, resolution, resolution)
-    # Цвета: Фон(0)-Красный, Лес(1)-Зеленый
-    anc_mask[:, 0] = (ancmsk == 0)  # R
-    anc_mask[:, 1] = (ancmsk == 1)  # G
-
-    # 3. Цветовая маска Pred
-    predmsk = output_vis.argmax(1)
-    rgb_mask = torch.zeros(row_N, 3, resolution, resolution)
-    rgb_mask[:, 0] = (predmsk == 0)  # R
-    rgb_mask[:, 1] = (predmsk == 1)  # G
-
-    # 4. Карта точности
-    r_pred = (output_vis.argmax(1) == y_vis.argmax(1))
-    rgb_acc = torch.zeros(row_N, 3, resolution, resolution)
-    rgb_acc[:, 0] = (~r_pred) * 255  # Ошибки - Красный
-    rgb_acc[:, 1] = (r_pred) * 255   # Правильно - Зеленый
-    rgb_acc = (rgb_acc / 255)
-
-    # Склеиваем сэмплы по вертикали
+    
+    def colorize_mask(idx_mask):
+        rgb = torch.zeros(idx_mask.shape[0], 3, resolution, resolution)
+        for cls_idx, (r, g, b) in TARGET_COLORS.items():
+            match = (idx_mask == cls_idx)
+            rgb[:, 0][match] = r / 255.0
+            rgb[:, 1][match] = g / 255.0
+            rgb[:, 2][match] = b / 255.0
+        return rgb
+    
+    gt_rgb = colorize_mask(y_vis)
+    pred_idx = output_vis.argmax(1)
+    pred_rgb = colorize_mask(pred_idx)
+    
+    correct = (pred_idx == y_vis)
+    acc_rgb = torch.zeros(row_N, 3, resolution, resolution)
+    acc_rgb[:, 0] = (~correct).float()
+    acc_rgb[:, 1] = correct.float()
+    
     img_col = torch.cat(list(X_vis), dim=1)
-    y_col = torch.cat(list(anc_mask), dim=1)
-    out_col = torch.cat(list(rgb_mask), dim=1)
-    acc_col = torch.cat(list(rgb_acc), dim=1)
-
-    # Финальная склейка: [Img, GT, Pred, Acc] по горизонтали (dim=2)
-    return torch.cat([img_col, y_col, out_col, acc_col], dim=2)
+    gt_col = torch.cat(list(gt_rgb), dim=1)
+    pred_col = torch.cat(list(pred_rgb), dim=1)
+    acc_col = torch.cat(list(acc_rgb), dim=1)
+    
+    return torch.cat([img_col, gt_col, pred_col, acc_col], dim=2)
 
 for epoch in range(start_epoch, EPOCHS + 1):
-
-    for phase in 'train val_t'.split():
-    # for phase in 'train val_t'.split():
+    for phase in ['train', 'val']:
         if phase == 'train':
             model.train()
             torch.set_grad_enabled(True)
             loader = train_loader
             optimizer.zero_grad()
-
-        # elif phase == 'val_big':
-        #     model.eval()
-        #     torch.set_grad_enabled(False)
-        #     loader = val_loader_big
-
-        elif phase == 'val_t':
+        else:
             model.eval()
             torch.set_grad_enabled(False)
-            loader = val_loader_target
+            loader = val_loader
 
         if phase != 'train':
             iou_metric.reset()
             accuracy_metric.reset()
 
-        running_ans = []
-        running_pred = []
         running_loss = []
-        running_acc = []
-
-        running_acc_1 = []
-        all_ious = []
-        # Переменные для визуализации картинок
         X_vis, y_vis, output_vis = None, None, None
         step = 0
+        
         for batch in tqdm(loader, desc=f'{phase} loader in {epoch} epoch:'):
             X, y = batch
             X_normalized = normalize_tensor(X)
-            output = model(X_normalized)
-            loss = criterion(output, y.cuda())
+            
+            with torch.amp.autocast('cuda'):
+                output = model(X_normalized)
+                loss = criterion(output, y.cuda())
+                
             running_loss.append(loss.item())
 
-            # Собираем данные для визуализации train (как на валидации)
             if phase == 'train' and ((epoch % WRITER_EPOCH == 0) or epoch == 1) and X_vis is None:
                 X_vis = X[:min(6, X.shape[0])]
                 y_vis = y[:min(6, X.shape[0])]
@@ -267,15 +225,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             step += 1
             if phase != 'train' and ((epoch % WRITER_EPOCH == 0) or epoch == 1):
-                running_ans = y.detach().to(torch.bool).cpu()
-                running_pred = output.detach().cpu()
-
-                running_pred = (torch.eq(running_pred, running_pred.max(1)[0].unsqueeze(1).repeat(1, 2, 1, 1)))
-                running_acc_1.append(running_pred[running_ans])
-
-                # Вычисляем IoU для каждого класса
-                pred_classes = output.argmax(dim=1).cpu().detach()  # [B, H, W]
-                target_classes = y.argmax(dim=1).cpu()  # [B, H, W]
+                pred_classes = output.argmax(dim=1).cpu().detach()
+                target_classes = y.cpu()
                 accuracy_metric.update(pred_classes, target_classes)
                 iou_metric.update(pred_classes, target_classes)
 
@@ -284,22 +235,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     y_vis = y[:min(6, X.shape[0])]
                     output_vis = output.detach().cpu()[:min(6, X.shape[0])]
 
-                del running_ans
-                del running_pred
-
             if phase == 'train':
-                # Накопление градиентов: масштабируем loss, чтобы эффективный батч = BATCH_SIZE * ACCUMULATION_STEPS
-                (loss / ACCUMULATION_STEPS).backward()
+                scaler.scale(loss / ACCUMULATION_STEPS).backward()
                 if step % ACCUMULATION_STEPS == 0:
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
 
-
-        mean_loss = sum(running_loss) / len(running_loss)
+        mean_loss = sum(running_loss) / len(running_loss) if running_loss else 0.0
         del running_loss
 
-        if phase == 'val_t' and mean_loss < top_mean_loss:
+        if phase == 'val' and mean_loss < top_mean_loss:
             model_state_dict = model.state_dict()
             optimizer_state_dict = optimizer.state_dict()
             scheduler_state_dict = scheduler.state_dict()
@@ -308,22 +255,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
             top_mean_loss = mean_loss
 
         if phase != 'train' and ((epoch % WRITER_EPOCH == 0) or epoch == 1):
-            class_ious = iou_metric.compute()  # [6] - IoU для каждого класса
+            class_ious = iou_metric.compute()
             overall_iou = class_ious.mean().item()
-            acc_2 = accuracy_metric.compute().item()
+            acc = accuracy_metric.compute().item()
 
-            print(f'точность {phase}_acc_2', f'{acc_2:.4f}')
+            print(f'точность {phase}_acc', f'{acc:.4f}')
             print(f'IoU {phase}_iou', f'{overall_iou:.4f}')
-            print("Имена классов: ['Фон', 'Лес']")
+            print(f"Имена классов: {list(TARGET_CLASS_NAMES.values())}")
             print(f'  Class IoUs: {[f"{iou:.4f}" for iou in class_ious.cpu().numpy()]}')
 
-            # Сбрасываем метрики для следующей эпохи
             iou_metric.reset()
             accuracy_metric.reset()
-            acc = torch.cat(running_acc_1, dim=0).to(torch.float32).mean().cpu()
-            print(f'точность {phase}_acc', acc)
-            del running_acc_1
-            if phase == 'val_t' and acc > top_acc:
+            
+            if phase == 'val' and acc > top_acc:
                 model_state_dict = model.state_dict()
                 optimizer_state_dict = optimizer.state_dict()
                 scheduler_state_dict = scheduler.state_dict()
@@ -331,7 +275,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                                  'top_model.pt', scheduler_state_dict)
                 top_acc = acc
 
-            # Визуализация изображений (как в старом коде)
             if (epoch % WRITER_EPOCH == 0) or epoch == 1:
                 if X_vis is not None:
                     out_img = build_vis_image(X_vis, y_vis, output_vis, resolution)
@@ -339,10 +282,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     writer.add_scalar(f'{phase}_acc', acc, epoch)
                     writer.add_scalar(f'{phase}_iou', overall_iou, epoch)
 
-                    print(f'точность {phase}_acc (manual)', acc)
-                    print(f'IoU {phase}', overall_iou)
-
-        # Запись изображения с результатами обучения в TensorBoard (формат как на валидации)
         if phase == 'train' and ((epoch % WRITER_EPOCH == 0) or epoch == 1) and X_vis is not None:
             out_img = build_vis_image(X_vis, y_vis, output_vis, resolution)
             writer.add_image('train_img', out_img, epoch)
@@ -357,7 +296,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
         save_checkpoints(epoch, model_state_dict, optimizer_state_dict, mean_loss, experiment_dir,
                          f'{epoch:05d}.pt', scheduler_state_dict)
 
-    # Save last epoch checkpoint (overwritten every epoch)
     model_state_dict = model.state_dict()
     optimizer_state_dict = optimizer.state_dict()
     scheduler_state_dict = scheduler.state_dict()
@@ -369,4 +307,3 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
 torch.cuda.empty_cache()
 writer.close()
-

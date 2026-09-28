@@ -403,7 +403,7 @@ class SyncRotate360_plus():
             else:
                 expand = False
             img_r = F.rotate(img, -angle, resample, expand, None, list(np.zeros(len(img.getbands()))))
-            mask_r = F.rotate(mask, -angle, resample, expand, None, list(np.zeros(len(mask.getbands()))))
+            mask_r = F.rotate(mask, -angle, IMode.NEAREST, expand, None, [0] * len(mask.getbands()))
 
             if expand:
                 w, h = img_r.size
@@ -650,11 +650,19 @@ class SyncCompose:
 
 
 class SyncToTensor:
+    """Конвертация PIL-изображения и маски в тензоры."""
     def __init__(self):
         self.tt = ToTensor()
 
     def __call__(self, img, mask, **kwargs):
-        return self.tt(img), self.tt(mask)
+        img_tensor = self.tt(img)  # [C, H, W] float
+        mask_np = np.array(mask)
+        if mask_np.ndim == 3:
+            # Обратная совместимость: RGB маска → один канал
+            mask_tensor = torch.from_numpy(mask_np[:, :, 0].copy()).long()
+        else:
+            mask_tensor = torch.from_numpy(mask_np.copy()).long()  # [H, W]
+        return img_tensor, mask_tensor
 
 
 class AffineAugmentation:
@@ -727,9 +735,12 @@ class AffineAugmentation:
         img_aug = res["image"]
         masks_aug_list = res["masks"]
 
-        # 5. Собираем маску обратно в (H, W, 3) и конвертируем в PIL
-        masks_aug_np = np.stack(masks_aug_list, axis=-1)  # -> (H, W, 3)
-        masks_aug_pil = Image.fromarray(masks_aug_np.astype(np.uint8))
+        # 5. Собираем маску обратно
+        if len(masks_aug_list) == 1:
+            masks_aug_pil = Image.fromarray(masks_aug_list[0].astype(np.uint8), mode='L')
+        else:
+            masks_aug_np = np.stack(masks_aug_list, axis=-1)
+            masks_aug_pil = Image.fromarray(masks_aug_np.astype(np.uint8))
 
         return Image.fromarray(img_aug), masks_aug_pil
 
