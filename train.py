@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from datasets.dataset import prepare_datasets, segmentation_collate_fn, NUM_TARGET_CLASSES, TARGET_CLASS_NAMES
 import segmentation_models_pytorch as smp
@@ -14,17 +15,24 @@ from datetime import datetime
 
 class _Tee:
     """Пишет вывод одновременно в консоль и в лог-файл."""
-    def __init__(self, *files):
-        self.files = files
+    def __init__(self, stream, log_file):
+        self.stream = stream
+        self.log_file = log_file
 
     def write(self, data):
-        for f in self.files:
-            f.write(data)
-            f.flush()
+        self.stream.write(data)
+        self.stream.flush()
+        # Для лог-файла пропускаем промежуточные '\r' обновления progress-бара
+        if '\r' in data and '\n' not in data:
+            return
+        clean_data = data.replace('\r', '')
+        if clean_data:
+            self.log_file.write(clean_data)
+            self.log_file.flush()
 
     def flush(self):
-        for f in self.files:
-            f.flush()
+        self.stream.flush()
+        self.log_file.flush()
 
 
 # Сохраняем весь вывод в консоль в текстовый файл в папке logs
@@ -100,10 +108,12 @@ param_dicts = [
 
 optimizer = torch.optim.AdamW(param_dicts, weight_decay=1e-4)
 
+steps_per_epoch = max(1, math.ceil(len(train_loader) / ACCUMULATION_STEPS))
+
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
     max_lr=[1e-5, 1e-4],  # [encoder, decoder]
-    steps_per_epoch=max(1, len(train_loader) // ACCUMULATION_STEPS),
+    steps_per_epoch=steps_per_epoch,
     epochs=EPOCHS,
     pct_start=0.1,
     div_factor=10.0,
@@ -118,7 +128,7 @@ class ComboLoss(nn.Module):
         self.weights = weights
         self.dice_loss = smp.losses.DiceLoss(mode='multiclass', from_logits=True)
         self.ce_loss = nn.CrossEntropyLoss()
-        self.focal_loss = smp.losses.FocalLoss(mode='multiclass', alpha=0.25, gamma=2.0)
+        self.focal_loss = smp.losses.FocalLoss(mode='multiclass', gamma=2.0)
 
     def forward(self, outputs, targets):
         loss = 0.0
@@ -147,7 +157,7 @@ if continue_with:
 logs_root = Path('/mnt/980EAB530EAB2968/hdd_logs/OtherProject/SPACE')
 experiment_dir = logs_root / LABEL
 writer = SummaryWriter(experiment_dir)
-top_acc = 0
+top_iou = 0.0
 top_mean_loss = 200
 
 TARGET_COLORS = {
@@ -208,7 +218,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         X_vis, y_vis, output_vis = None, None, None
         step = 0
         
-        for batch in tqdm(loader, desc=f'{phase} loader in {epoch} epoch:'):
+        for batch in tqdm(loader, desc=f'{phase} loader in {epoch} epoch:', mininterval=2.0):
             X, y = batch
             X_normalized = normalize_tensor(X)
             
@@ -237,7 +247,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             if phase == 'train':
                 scaler.scale(loss / ACCUMULATION_STEPS).backward()
-                if step % ACCUMULATION_STEPS == 0:
+                is_accum_step = (step % ACCUMULATION_STEPS == 0) or (step == len(train_loader))
+                if is_accum_step:
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
@@ -256,7 +267,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         if phase != 'train' and ((epoch % WRITER_EPOCH == 0) or epoch == 1):
             class_ious = iou_metric.compute()
-            overall_iou = class_ious.mean().item()
+            overall_iou = torch.nanmean(class_ious).item()
             acc = accuracy_metric.compute().item()
 
             print(f'точность {phase}_acc', f'{acc:.4f}')
@@ -267,13 +278,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             iou_metric.reset()
             accuracy_metric.reset()
             
-            if phase == 'val' and acc > top_acc:
+            if phase == 'val' and overall_iou > top_iou:
                 model_state_dict = model.state_dict()
                 optimizer_state_dict = optimizer.state_dict()
                 scheduler_state_dict = scheduler.state_dict()
                 save_checkpoints(epoch, model_state_dict, optimizer_state_dict, mean_loss, experiment_dir,
                                  'top_model.pt', scheduler_state_dict)
-                top_acc = acc
+                top_iou = overall_iou
 
             if (epoch % WRITER_EPOCH == 0) or epoch == 1:
                 if X_vis is not None:
