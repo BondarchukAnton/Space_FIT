@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, ConcatDataset
 from PIL import Image
 import tifffile
 
+from .semantic_sync_transforms import SyncCompose, SyncToTensor
 from .semantic_sync_transforms import (
     SyncCompose,
     SyncRandomHorizontalFlip,
@@ -28,26 +29,27 @@ from .semantic_sync_transforms import (
     RandomGridDistortion,
 )
 
+
+
 logger = logging.getLogger(__name__)
 
 NUM_TARGET_CLASSES = 7
 TARGET_CLASS_NAMES = {
-    0: 'Фон',                    # Background
+    0: 'Фон',                    # Background (no scene)
     1: 'Лесной массив',          # Forest
-    2: 'Поле',                   # Field / Agriculture
+    2: 'Поле',                   # Field/Agriculture
     3: 'Водоём',                 # Water
     4: 'Городская территория',   # Urban
     5: 'Горный район',           # Mountain
     6: 'Прочее',                 # Other
 }
 
-# Маппинги классов для каждого датасета в единое пространство (0..6)
-
+# Маппинги для датасетов
 DEEPGLOBE_COLOR_MAP = {
     (0, 0, 0): 0,        # unknown → Фон
     (0, 255, 255): 4,    # urban_land → Городская территория
     (255, 255, 0): 2,    # agriculture_land → Поле
-    (255, 0, 255): 6,    # rangeland → Прочее
+    (255, 0, 255): 2,    # rangeland → Прочее
     (0, 255, 0): 1,      # forest_land → Лесной массив
     (0, 0, 255): 3,      # water → Водоём
     (255, 255, 255): 5,  # barren_land → Горный район
@@ -58,7 +60,7 @@ LANDCOVERAI_CLASS_MAP = {
     1: 4,  # Building → Городская территория
     2: 1,  # Woodland → Лесной массив
     3: 3,  # Water → Водоём
-    4: 4,  # Road → Городская территория
+    4: 6,  # Road → Городская территория
 }
 
 GID_COLOR_MAP = {
@@ -66,7 +68,7 @@ GID_COLOR_MAP = {
     (255, 0, 0): 4,      # built-up → Городская территория
     (0, 255, 0): 2,      # farmland → Поле
     (0, 255, 255): 1,    # forest → Лесной массив
-    (255, 255, 0): 6,    # meadow → Прочее
+    (255, 255, 0): 2,    # meadow → Прочее
     (0, 0, 255): 3,      # water → Водоём
 }
 
@@ -77,20 +79,20 @@ WHU_CLASS_MAP = {
     30: 4,   # Village → Городская территория
     40: 3,   # Water → Водоём
     50: 1,   # Forest → Лесной массив
-    60: 6,   # Road → Прочее (согласно проверенной эталонной спецификации)
+    60: 6,   # Road → Городская территория
     70: 6,   # Others → Прочее
 }
 
 DODW_CLASS_MAP = {
     0: 3,   # water → Водоём
     1: 1,   # trees → Лесной массив
-    2: 6,   # grass → Прочее
-    3: 6,   # flooded_vegetation → Прочее
+    2: 2,   # grass → Прочее
+    3: 3,   # flooded_vegetation → Прочее
     4: 2,   # crops → Поле
-    5: 6,   # shrub_and_scrub → Прочее
+    5: 2,   # shrub_and_scrub → Прочее
     6: 4,   # built → Городская территория
     7: 5,   # bare → Горный район
-    8: 5,   # snow_and_ice → Горный район
+    8: 6,   # snow_and_ice → Горный район
 }
 
 
@@ -183,6 +185,7 @@ def apply_index_map(mask_np: np.ndarray, index_map: Dict[int, int]) -> np.ndarra
 
 class LRUImageCache:
     """LRU-кэш смасштабированных полноразмерных изображений и масок."""
+
     def __init__(self, maxsize: int = 8):
         self.maxsize = maxsize
         self.cache: OrderedDict[int, Tuple[Image.Image, Image.Image]] = OrderedDict()
@@ -203,6 +206,7 @@ class LRUImageCache:
 
 class BasePatchDataset(Dataset):
     """Базовый класс для датасетов патчей с LRU-кэшированием исходных снимков."""
+
     def __init__(self, transforms=None, resolution=512):
         self.transforms = transforms or []
         self.resolution = resolution
@@ -245,13 +249,14 @@ class BasePatchDataset(Dataset):
 
 
 class DeepGlobeData(BasePatchDataset):
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
+    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
+                 class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
         self.target_m_per_px = target_m_per_px
         self.class_mapping = class_mapping or DEEPGLOBE_COLOR_MAP
-        
+
         self.native_gsd = 0.5
         self.scale_factor = self.native_gsd / self.target_m_per_px
 
@@ -264,7 +269,7 @@ class DeepGlobeData(BasePatchDataset):
                     self.files.append((img_path, mask_path))
 
         logger.info("Инициализация DeepGlobeData (%s): найдено %d пар.", split, len(self.files))
-        
+
         for i, (img_path, _) in enumerate(self.files):
             with Image.open(img_path) as tmp:
                 w, h = tmp.size
@@ -279,7 +284,7 @@ class DeepGlobeData(BasePatchDataset):
             return cached
 
         img_path, mask_path = self.files[idx_file]
-        
+
         img = Image.open(img_path).convert('RGB')
         sw, sh = max(1, int(img.size[0] * self.scale_factor)), max(1, int(img.size[1] * self.scale_factor))
         img = img.resize((sw, sh), Image.Resampling.LANCZOS)
@@ -300,7 +305,9 @@ class LandCoverAIData(BasePatchDataset):
     Dataset для LandCover.ai. Загружает полноразмерные исходные ортофотопланы из images/ и маски из masks/
     (формата GeoTIFF/TIF), масштабируя их с исходного разрешения (0.25 или 0.50 м/пикс) до целевого target_m_per_px.
     """
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
+
+    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
+                 class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
@@ -308,11 +315,11 @@ class LandCoverAIData(BasePatchDataset):
         self.class_mapping = class_mapping or LANDCOVERAI_CLASS_MAP
 
         self.files = []
-        
+
         # 1. Поиск оригинальных полноразмерных снимков (images/ и masks/)
         img_dir = self.root_dir / "images"
         mask_dir = self.root_dir / "masks"
-        
+
         if not img_dir.exists():
             img_dir = self.root_dir
         if not mask_dir.exists():
@@ -441,18 +448,18 @@ class LandCoverAIData(BasePatchDataset):
         return res
 
 
-
 class GIDData(BasePatchDataset):
     # Обрезка черных полей снимков Gaofen-2 (left, top, right, bottom)
     CROP_BORDER = (60, 54, 7260, 6854)
 
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
+    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
+                 class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
         self.target_m_per_px = target_m_per_px
         self.class_mapping = class_mapping or GID_COLOR_MAP
-        
+
         self.native_gsd = 4.0
         self.scale_factor = self.native_gsd / self.target_m_per_px
 
@@ -472,7 +479,7 @@ class GIDData(BasePatchDataset):
                     self.files.append((img_path, mask_path))
 
         logger.info("Инициализация GIDData (%s): найдено %d пар.", split, len(self.files))
-        
+
         l, t, r, b = self.CROP_BORDER
         crop_w, crop_h = r - l, b - t
         sw, sh = max(1, int(crop_w * self.scale_factor)), max(1, int(crop_h * self.scale_factor))
@@ -488,14 +495,14 @@ class GIDData(BasePatchDataset):
             return cached
 
         img_path, mask_path = self.files[idx_file]
-        
+
         img_arr = tifffile.imread(img_path)
         if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
             img_arr = np.transpose(img_arr, (1, 2, 0))
-            
+
         # Формат NirRGB: каналы [NIR(0), R(1), G(2), B(3)]. Берём каналы [1, 2, 3] для формирования RGB.
         rgb_arr = img_arr[:, :, [1, 2, 3]]
-        
+
         l, t, r, b = self.CROP_BORDER
         rgb_arr = rgb_arr[t:b, l:r]
 
@@ -518,13 +525,14 @@ class GIDData(BasePatchDataset):
 
 
 class WHUOptSarData(BasePatchDataset):
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
+    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
+                 class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
         self.target_m_per_px = target_m_per_px
         self.class_mapping = class_mapping or WHU_CLASS_MAP
-        
+
         self.native_gsd = 5.0
         self.scale_factor = self.native_gsd / self.target_m_per_px
 
@@ -543,7 +551,7 @@ class WHUOptSarData(BasePatchDataset):
                     self.files.append((img_path, mask_path))
 
         logger.info("Инициализация WHUOptSarData (%s): найдено %d пар.", split, len(self.files))
-        
+
         for i, (img_path, _) in enumerate(self.files):
             with tifffile.TiffFile(img_path) as tif:
                 shape = tif.pages[0].shape
@@ -563,7 +571,7 @@ class WHUOptSarData(BasePatchDataset):
             return cached
 
         img_path, mask_path = self.files[idx_file]
-        
+
         img_arr = tifffile.imread(img_path)
         if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
             img_arr = np.transpose(img_arr, (1, 2, 0))
@@ -580,7 +588,7 @@ class WHUOptSarData(BasePatchDataset):
             mask_arr = np.squeeze(mask_arr, axis=-1)
         elif mask_arr.ndim == 3 and mask_arr.shape[0] == 1:
             mask_arr = np.squeeze(mask_arr, axis=0)
-            
+
         idx_mask_np = apply_index_map(mask_arr, self.class_mapping)
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
@@ -591,20 +599,21 @@ class WHUOptSarData(BasePatchDataset):
 
 
 class DODWData(BasePatchDataset):
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
+    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
+                 class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
         self.target_m_per_px = target_m_per_px
         self.class_mapping = class_mapping or DODW_CLASS_MAP
-        
+
         self.native_gsd = 10.0
         self.scale_factor = self.native_gsd / self.target_m_per_px
 
         all_files = []
         img_dir = self.root_dir / "s2_images"
         mask_dir = self.root_dir / "dw_test_zenodo"
-        
+
         if img_dir.exists() and mask_dir.exists():
             for img_path in sorted(img_dir.glob("s2_dw_*_B02-B03-B04-B08.tif")):
                 common_part = img_path.name.replace("s2_dw_", "").replace("_B02-B03-B04-B08.tif", "")
@@ -620,7 +629,7 @@ class DODWData(BasePatchDataset):
             self.files = all_files[num_train:]
 
         logger.info("Инициализация DODWData (%s): найдено %d пар. Фильтрация пустых снимков...", split, len(self.files))
-        
+
         valid_files = []
         for img_path, mask_path in self.files:
             img_arr = tifffile.imread(img_path)
@@ -628,15 +637,15 @@ class DODWData(BasePatchDataset):
                 continue
             valid_idx = len(valid_files)
             valid_files.append((img_path, mask_path))
-            
+
             shape = img_arr.shape
             h, w = (shape[1], shape[2]) if shape[0] == 4 else (shape[0], shape[1])
-            
+
             sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
             starts = compute_patch_starts(sw, sh, self.resolution)
             for px, py in starts:
                 self.patches.append((valid_idx, px, py))
-                
+
         self.files = valid_files
 
     def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
@@ -645,7 +654,7 @@ class DODWData(BasePatchDataset):
             return cached
 
         img_path, mask_path = self.files[idx_file]
-        
+
         img_arr = tifffile.imread(img_path)
         if len(img_arr.shape) == 3 and img_arr.shape[0] == 4:
             img_arr = np.transpose(img_arr, (1, 2, 0))
@@ -660,7 +669,7 @@ class DODWData(BasePatchDataset):
             mask_arr = np.transpose(mask_arr, (1, 2, 0))
         # Канал 0 — исходные разметки (Ground Truth), канал 1 — предсказания модели Dynamic World
         gt_channel = mask_arr[:, :, 0]
-        
+
         idx_mask_np = apply_index_map(gt_channel, self.class_mapping)
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
@@ -671,49 +680,46 @@ class DODWData(BasePatchDataset):
 
 
 def prepare_datasets(resolution=512, target_m_per_px=10.0,
-                     deepglobe=True, landcoverai=True, gid=True, whu=True, dodw=True,
-                     root_dirs: Optional[Dict[str, str]] = None):
+                     deepglobe=True, landcoverai=True, gid=True, whu=True, dodw=True):
     """
-    Создаёт обучающую и валидационную выборки с настроенным пайплайном синхронных аугментаций.
+    Функция для подготовки тренировочной и валидационной выборок.
     """
-    root_dirs = root_dirs or {}
-    
-    DEEPGLOBE_ROOT = pathlib.Path(root_dirs.get('deepglobe', '/path/to/DeepGlobe_Land'))
-    LANDCOVERAI_ROOT = pathlib.Path(root_dirs.get('landcoverai', '/path/to/landcoverai'))
-    GID_ROOT = pathlib.Path(root_dirs.get('gid', '/path/to/GID'))
-    WHU_ROOT = pathlib.Path(root_dirs.get('whu', '/path/to/WHU-OPT-SAR dataset'))
-    DODW_ROOT = pathlib.Path(root_dirs.get('dodw', '/path/to/Dataset_Open_Dynamic_World_Test_Tiles'))
+    # ---- Пути к датасетам (заглушки — указать реальные пути) ----
+    DEEPGLOBE_ROOT = pathlib.Path('/mnt/980EAB530EAB2968/Segmentation_Dataset/DeepGlobe_Land')                       # DeepGlobe Land Cover
+    LANDCOVERAI_ROOT = pathlib.Path('/mnt/980EAB530EAB2968/Segmentation_Dataset/landcoverai')                        # LandCover.ai
+    GID_ROOT = pathlib.Path('/mnt/980EAB530EAB2968/Segmentation_Dataset/GID')                                        # GID (Gaofen-2)
+    WHU_ROOT = pathlib.Path('/mnt/980EAB530EAB2968/Segmentation_Dataset/WHU-OPT-SAR dataset')                        # WHU-OPT-SAR
+    DODW_ROOT = pathlib.Path('/media/user/2TB_SSD/Datasets_optINS3/Dataset_Open_Dynamic_World_Test_Tiles')     # Open Dynamic World
 
-    # Пайплайн аугментаций строго в установленном порядке
     s_rbct = SyncRandomBrightnessContrastTarget()
     sync_hor = SyncRandomHorizontalFlip()
     sync_v = SyncRandomVerticalFlip()
-    sync_rot = SyncRotate360_plus(resolution=resolution)
-    sync_r_g_d = RandomGridDistortion()
-    sync_r_e_t = RandomElasticTransform()
-    sync_r_up_dwn = TrickyResize_UpDwn(resolution=resolution)
-    sync_aff_aug = AffineAugmentation(resolution=resolution)
-    sync_res = SyncResize(resolution=resolution)
-    sync_to_tens = SyncToTensor()
-    sync_noise = RandomNoiseSP()
+    syns_rp = SyncRotate360_plus(resolution=resolution)
+    sync_rs = SyncResize(resolution)
+    rs_up_dwn = TrickyResize_UpDwn(resolution=resolution, minmax_size_up=[117, 200])
+    aa = AffineAugmentation(p=0.75, translate_percent=(-0.5, 0.5), scale=(0.7, 1.1))
+    sync_totensor = SyncToTensor()
+    rn = RandomNoiseSP()
+    ret = RandomElasticTransform()
+    rgd = RandomGridDistortion()
 
-    train_transforms = [
-        s_rbct,
-        sync_hor,
-        sync_v,
-        sync_rot,
-        sync_r_g_d,
-        sync_r_e_t,
-        sync_r_up_dwn,
-        sync_aff_aug,
-        sync_res,
-        sync_to_tens,
-        sync_noise,
-    ]
+    train_transforms = []
+
+    train_transforms.append(s_rbct)
+    train_transforms.append(sync_hor)
+    train_transforms.append(sync_v)
+    train_transforms.append(syns_rp)
+    train_transforms.append(rgd)
+    train_transforms.append(ret)
+    train_transforms.append(rs_up_dwn)
+    train_transforms.append(aa)
+    train_transforms.append(sync_rs)
+    train_transforms.append(sync_totensor)
+    train_transforms.append(rn)
 
     val_transforms = [
-        sync_res,
-        sync_to_tens,
+        sync_rs,
+        sync_totensor,
     ]
 
     train_datasets = []
@@ -748,7 +754,7 @@ def prepare_datasets(resolution=512, target_m_per_px=10.0,
 def segmentation_collate_fn(batch):
     """
     Формирует батч для семантической сегментации.
-    
+
     Returns:
         images: [B, 3, H, W] float tensor
         masks: [B, H, W] long tensor с индексами классов (0..6)
@@ -763,12 +769,12 @@ def segmentation_collate_fn(batch):
                 img = img.repeat(3, 1, 1)
             elif img.shape[0] > 3:
                 img = img[:3]
-        
+
         if isinstance(mask, torch.Tensor):
             if mask.ndim == 3 and mask.shape[0] == 1:
                 mask = mask.squeeze(0)
             mask = mask.long()
-            
+
         images.append(img)
         masks.append(mask)
 
