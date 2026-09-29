@@ -3,32 +3,46 @@ import math
 import random
 import logging
 import pathlib
-import numpy as np
-from functools import lru_cache
-from typing import List, Tuple, Dict, Optional
+from collections import OrderedDict
+from typing import List, Tuple, Dict, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, ConcatDataset
 from PIL import Image
 import tifffile
 
-from .semantic_sync_transforms import SyncCompose, SyncToTensor
+from .semantic_sync_transforms import (
+    SyncCompose,
+    SyncRandomHorizontalFlip,
+    SyncRotate360_plus,
+    SyncToTensor,
+    SyncRandomVerticalFlip,
+    TrickyResize_UpDwn,
+    SyncResize,
+    RandomNoiseSP,
+    AffineAugmentation,
+    SyncRandomBrightnessContrastTarget,
+    RandomElasticTransform,
+    RandomGridDistortion,
+)
 
 logger = logging.getLogger(__name__)
 
 NUM_TARGET_CLASSES = 7
 TARGET_CLASS_NAMES = {
-    0: 'Фон',                    # Background (no scene)
+    0: 'Фон',                    # Background
     1: 'Лесной массив',          # Forest
-    2: 'Поле',                   # Field/Agriculture
+    2: 'Поле',                   # Field / Agriculture
     3: 'Водоём',                 # Water
     4: 'Городская территория',   # Urban
     5: 'Горный район',           # Mountain
     6: 'Прочее',                 # Other
 }
 
-# Маппинги для датасетов
+# Маппинги классов для каждого датасета в единое пространство (0..6)
+
 DEEPGLOBE_COLOR_MAP = {
     (0, 0, 0): 0,        # unknown → Фон
     (0, 255, 255): 4,    # urban_land → Городская территория
@@ -63,7 +77,7 @@ WHU_CLASS_MAP = {
     30: 4,   # Village → Городская территория
     40: 3,   # Water → Водоём
     50: 1,   # Forest → Лесной массив
-    60: 4,   # Road → Городская территория
+    60: 6,   # Road → Прочее (согласно проверенной эталонной спецификации)
     70: 6,   # Others → Прочее
 }
 
@@ -82,19 +96,20 @@ DODW_CLASS_MAP = {
 
 def n_e_augs_shuffle(augs_list, n=-3, skip_first=False):
     """
-    Перемешивает первые (или срединные) элементы списка аугментаций.
+    Перемешивает ранние элементы списка аугментаций,
+    сохраняя фиксированный порядок последних |n| элементов (SyncResize, SyncToTensor, RandomNoiseSP).
     """
     augs_list = list(augs_list)
-    if len(augs_list) > 3:
+    if len(augs_list) > abs(n):
         s = 1 if skip_first else 0
-        first_n = augs_list[s:n]
-        random.shuffle(first_n)
-        augs_list[s:n] = first_n
+        first_part = augs_list[s:n]
+        random.shuffle(first_part)
+        augs_list[s:n] = first_part
     return augs_list
 
 
 def pad_image_centered(img: Image.Image, target_size: int) -> Image.Image:
-    """Центрированный паддинг изображения нулями."""
+    """Центрированный паддинг изображения нулями до target_size."""
     w, h = img.size
     if w >= target_size and h >= target_size:
         return img
@@ -108,7 +123,7 @@ def pad_image_centered(img: Image.Image, target_size: int) -> Image.Image:
 
 
 def pad_mask_centered(mask: Image.Image, target_size: int) -> Image.Image:
-    """Центрированный паддинг маски фоновым классом (0)."""
+    """Центрированный паддинг маски фоновым классом (0) до target_size."""
     w, h = mask.size
     if w >= target_size and h >= target_size:
         return mask
@@ -122,26 +137,33 @@ def pad_mask_centered(mask: Image.Image, target_size: int) -> Image.Image:
 
 
 def compute_patch_starts(w: int, h: int, patch_size: int) -> List[Tuple[int, int]]:
-    """Вычисляет начальные координаты (x, y) для нарезки изображения скользящим окном."""
+    """
+    Вычисляет начальные координаты (x, y) для нарезки скользящим окном
+    с равномерным перекрытием по формуле step = (size - res) // ceil((size - res) / res).
+    """
     if w <= patch_size:
         x_starts = [0]
     else:
-        x_starts = list(range(0, w, patch_size))
-        if x_starts[-1] + patch_size > w:
-            x_starts[-1] = w - patch_size
+        num_steps_x = math.ceil((w - patch_size) / patch_size)
+        step_x = (w - patch_size) // num_steps_x if num_steps_x > 0 else patch_size
+        x_starts = list(range(0, w - patch_size + 1, step_x))
+        if x_starts[-1] != w - patch_size:
+            x_starts.append(w - patch_size)
 
     if h <= patch_size:
         y_starts = [0]
     else:
-        y_starts = list(range(0, h, patch_size))
-        if y_starts[-1] + patch_size > h:
-            y_starts[-1] = h - patch_size
+        num_steps_y = math.ceil((h - patch_size) / patch_size)
+        step_y = (h - patch_size) // num_steps_y if num_steps_y > 0 else patch_size
+        y_starts = list(range(0, h - patch_size + 1, step_y))
+        if y_starts[-1] != h - patch_size:
+            y_starts.append(h - patch_size)
 
     return [(x, y) for x in x_starts for y in y_starts]
 
 
 def apply_color_map(mask_np: np.ndarray, color_map: Dict[Tuple[int, int, int], int]) -> np.ndarray:
-    """Векторизованное применение цветового маппинга."""
+    """Векторизованное преобразование RGB-маски в одноканальные индексы классов (0..6)."""
     out = np.zeros((mask_np.shape[0], mask_np.shape[1]), dtype=np.uint8)
     for color, class_idx in color_map.items():
         match = (mask_np[:, :, 0] == color[0]) & \
@@ -152,22 +174,40 @@ def apply_color_map(mask_np: np.ndarray, color_map: Dict[Tuple[int, int, int], i
 
 
 def apply_index_map(mask_np: np.ndarray, index_map: Dict[int, int]) -> np.ndarray:
-    """Векторизованное применение маппинга индексов."""
+    """Векторизованный перемаппинг исходных индексов в единые индексы классов (0..6)."""
     out = np.zeros_like(mask_np, dtype=np.uint8)
     for in_idx, out_idx in index_map.items():
         out[mask_np == in_idx] = out_idx
     return out
 
 
+class LRUImageCache:
+    """LRU-кэш смасштабированных полноразмерных изображений и масок."""
+    def __init__(self, maxsize: int = 8):
+        self.maxsize = maxsize
+        self.cache: OrderedDict[int, Tuple[Image.Image, Image.Image]] = OrderedDict()
+
+    def get(self, key: int) -> Optional[Tuple[Image.Image, Image.Image]]:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key: int, value: Tuple[Image.Image, Image.Image]):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
+
+
 class BasePatchDataset(Dataset):
-    """Базовый класс для датасетов с кэшированием и нарезкой патчей."""
+    """Базовый класс для датасетов патчей с LRU-кэшированием исходных снимков."""
     def __init__(self, transforms=None, resolution=512):
         self.transforms = transforms or []
         self.resolution = resolution
-        self.patches = []
-        self._cached_idx = -1
-        self._cached_img = None
-        self._cached_mask = None
+        self.patches: List[Tuple[int, int, int]] = []
+        self.cache = LRUImageCache(maxsize=8)
 
     def __len__(self):
         return len(self.patches)
@@ -186,10 +226,19 @@ class BasePatchDataset(Dataset):
         mask_patch = pad_mask_centered(mask_patch, self.resolution)
 
         if self.transforms:
-            sync_transforms = SyncCompose(n_e_augs_shuffle(self.transforms))
-            names = list(range(len(self.transforms)))
-            img_tensor, mask_tensor = sync_transforms(img=img_patch, mask=mask_patch, names=names)
-            return img_tensor, mask_tensor
+            shuffled_transforms = n_e_augs_shuffle(self.transforms)
+            sync_transforms = SyncCompose(shuffled_transforms)
+            names = list(range(len(self.patches)))
+            res = sync_transforms(
+                img=img_patch,
+                mask=mask_patch,
+                img_path=file_idx,
+                mask_path=file_idx,
+                names=names
+            )
+            if isinstance(res, (tuple, list)):
+                return res[0], res[1]
+            return res
         else:
             tt = SyncToTensor()
             return tt(img=img_patch, mask=mask_patch)
@@ -216,18 +265,18 @@ class DeepGlobeData(BasePatchDataset):
 
         logger.info("Инициализация DeepGlobeData (%s): найдено %d пар.", split, len(self.files))
         
-        if self.files:
-            with Image.open(self.files[0][0]) as tmp:
+        for i, (img_path, _) in enumerate(self.files):
+            with Image.open(img_path) as tmp:
                 w, h = tmp.size
             sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
             starts = compute_patch_starts(sw, sh, self.resolution)
-            for i in range(len(self.files)):
-                for px, py in starts:
-                    self.patches.append((i, px, py))
+            for px, py in starts:
+                self.patches.append((i, px, py))
 
-    def _get_scaled_image_and_mask(self, idx_file):
-        if self._cached_idx == idx_file:
-            return self._cached_img, self._cached_mask
+    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+        cached = self.cache.get(idx_file)
+        if cached is not None:
+            return cached
 
         img_path, mask_path = self.files[idx_file]
         
@@ -241,10 +290,9 @@ class DeepGlobeData(BasePatchDataset):
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self._cached_idx = idx_file
-        self._cached_img = img
-        self._cached_mask = idx_mask
-        return img, idx_mask
+        res = (img, idx_mask)
+        self.cache.put(idx_file, res)
+        return res
 
 
 class LandCoverAIData(BasePatchDataset):
@@ -270,18 +318,18 @@ class LandCoverAIData(BasePatchDataset):
 
         logger.info("Инициализация LandCoverAIData (%s): найдено %d пар.", split, len(self.files))
         
-        if self.files:
-            with Image.open(self.files[0][0]) as tmp:
+        for i, (img_path, _) in enumerate(self.files):
+            with Image.open(img_path) as tmp:
                 w, h = tmp.size
             sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
             starts = compute_patch_starts(sw, sh, self.resolution)
-            for i in range(len(self.files)):
-                for px, py in starts:
-                    self.patches.append((i, px, py))
+            for px, py in starts:
+                self.patches.append((i, px, py))
 
-    def _get_scaled_image_and_mask(self, idx_file):
-        if self._cached_idx == idx_file:
-            return self._cached_img, self._cached_mask
+    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+        cached = self.cache.get(idx_file)
+        if cached is not None:
+            return cached
 
         img_path, mask_path = self.files[idx_file]
         
@@ -298,13 +346,15 @@ class LandCoverAIData(BasePatchDataset):
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self._cached_idx = idx_file
-        self._cached_img = img
-        self._cached_mask = idx_mask
-        return img, idx_mask
+        res = (img, idx_mask)
+        self.cache.put(idx_file, res)
+        return res
 
 
 class GIDData(BasePatchDataset):
+    # Обрезка черных полей снимков Gaofen-2 (left, top, right, bottom)
+    CROP_BORDER = (60, 54, 7260, 6854)
+
     def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
@@ -332,47 +382,48 @@ class GIDData(BasePatchDataset):
 
         logger.info("Инициализация GIDData (%s): найдено %d пар.", split, len(self.files))
         
-        for i, (img_path, _) in enumerate(self.files):
-            with tifffile.TiffFile(img_path) as tif:
-                shape = tif.pages[0].shape
-                if len(shape) >= 3 and shape[2] in (3, 4):
-                    h, w = shape[0], shape[1]
-                elif len(shape) >= 3 and shape[0] in (3, 4):
-                    h, w = shape[1], shape[2]
-                else:
-                    h, w = shape[0], shape[1]
+        l, t, r, b = self.CROP_BORDER
+        crop_w, crop_h = r - l, b - t
+        sw, sh = max(1, int(crop_w * self.scale_factor)), max(1, int(crop_h * self.scale_factor))
+        starts = compute_patch_starts(sw, sh, self.resolution)
 
-            sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
-            starts = compute_patch_starts(sw, sh, self.resolution)
+        for i in range(len(self.files)):
             for px, py in starts:
                 self.patches.append((i, px, py))
 
-    def _get_scaled_image_and_mask(self, idx_file):
-        if self._cached_idx == idx_file:
-            return self._cached_img, self._cached_mask
+    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+        cached = self.cache.get(idx_file)
+        if cached is not None:
+            return cached
 
         img_path, mask_path = self.files[idx_file]
         
         img_arr = tifffile.imread(img_path)
-        if img_arr.shape[0] == 4:
+        if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
             img_arr = np.transpose(img_arr, (1, 2, 0))
             
-        rgb_arr = img_arr[:, :, [1, 2, 0]]
+        # Формат NirRGB: каналы [NIR(0), R(1), G(2), B(3)]. Берём каналы [1, 2, 3] для формирования RGB.
+        rgb_arr = img_arr[:, :, [1, 2, 3]]
+        
+        l, t, r, b = self.CROP_BORDER
+        rgb_arr = rgb_arr[t:b, l:r]
+
         img = Image.fromarray(rgb_arr, mode='RGB')
         sw, sh = max(1, int(img.size[0] * self.scale_factor)), max(1, int(img.size[1] * self.scale_factor))
         img = img.resize((sw, sh), Image.Resampling.LANCZOS)
 
         mask_arr = tifffile.imread(mask_path)
-        if mask_arr.shape[0] == 3:
+        if mask_arr.ndim == 3 and mask_arr.shape[0] == 3:
             mask_arr = np.transpose(mask_arr, (1, 2, 0))
+        mask_arr = mask_arr[t:b, l:r]
+
         idx_mask_np = apply_color_map(mask_arr, self.class_mapping)
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self._cached_idx = idx_file
-        self._cached_img = img
-        self._cached_mask = idx_mask
-        return img, idx_mask
+        res = (img, idx_mask)
+        self.cache.put(idx_file, res)
+        return res
 
 
 class WHUOptSarData(BasePatchDataset):
@@ -415,17 +466,18 @@ class WHUOptSarData(BasePatchDataset):
             for px, py in starts:
                 self.patches.append((i, px, py))
 
-    def _get_scaled_image_and_mask(self, idx_file):
-        if self._cached_idx == idx_file:
-            return self._cached_img, self._cached_mask
+    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+        cached = self.cache.get(idx_file)
+        if cached is not None:
+            return cached
 
         img_path, mask_path = self.files[idx_file]
         
         img_arr = tifffile.imread(img_path)
-        if len(img_arr.shape) == 3 and img_arr.shape[0] == 4:
+        if len(img_arr.shape) == 3 and img_arr.shape[0] in (3, 4):
             img_arr = np.transpose(img_arr, (1, 2, 0))
             
-        rgb_arr = img_arr[:, :, [2, 1, 0]]
+        rgb_arr = img_arr[:, :, [0, 1, 2]]
         img = Image.fromarray(rgb_arr, mode='RGB')
         sw, sh = max(1, int(img.size[0] * self.scale_factor)), max(1, int(img.size[1] * self.scale_factor))
         img = img.resize((sw, sh), Image.Resampling.LANCZOS)
@@ -440,10 +492,9 @@ class WHUOptSarData(BasePatchDataset):
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self._cached_idx = idx_file
-        self._cached_img = img
-        self._cached_mask = idx_mask
-        return img, idx_mask
+        res = (img, idx_mask)
+        self.cache.put(idx_file, res)
+        return res
 
 
 class DODWData(BasePatchDataset):
@@ -475,13 +526,14 @@ class DODWData(BasePatchDataset):
         else:
             self.files = all_files[num_train:]
 
-        logger.info("Инициализация DODWData (%s): найдено %d пар. Фильтрация пустых...", split, len(self.files))
+        logger.info("Инициализация DODWData (%s): найдено %d пар. Фильтрация пустых снимков...", split, len(self.files))
         
         valid_files = []
-        for i, (img_path, mask_path) in enumerate(self.files):
+        for img_path, mask_path in self.files:
             img_arr = tifffile.imread(img_path)
             if img_arr.max() == 0:
                 continue
+            valid_idx = len(valid_files)
             valid_files.append((img_path, mask_path))
             
             shape = img_arr.shape
@@ -490,13 +542,14 @@ class DODWData(BasePatchDataset):
             sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
             starts = compute_patch_starts(sw, sh, self.resolution)
             for px, py in starts:
-                self.patches.append((len(valid_files)-1, px, py))
+                self.patches.append((valid_idx, px, py))
                 
         self.files = valid_files
 
-    def _get_scaled_image_and_mask(self, idx_file):
-        if self._cached_idx == idx_file:
-            return self._cached_img, self._cached_mask
+    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+        cached = self.cache.get(idx_file)
+        if cached is not None:
+            return cached
 
         img_path, mask_path = self.files[idx_file]
         
@@ -512,42 +565,63 @@ class DODWData(BasePatchDataset):
         mask_arr = tifffile.imread(mask_path)
         if len(mask_arr.shape) == 3 and mask_arr.shape[0] == 2:
             mask_arr = np.transpose(mask_arr, (1, 2, 0))
-        gt_channel = mask_arr[:, :, 1]
+        # Канал 0 — исходные разметки (Ground Truth), канал 1 — предсказания модели Dynamic World
+        gt_channel = mask_arr[:, :, 0]
         
         idx_mask_np = apply_index_map(gt_channel, self.class_mapping)
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self._cached_idx = idx_file
-        self._cached_img = img
-        self._cached_mask = idx_mask
-        return img, idx_mask
+        res = (img, idx_mask)
+        self.cache.put(idx_file, res)
+        return res
 
 
 def prepare_datasets(resolution=512, target_m_per_px=10.0,
-                     deepglobe=True, landcoverai=True, gid=True, whu=True, dodw=True):
+                     deepglobe=True, landcoverai=True, gid=True, whu=True, dodw=True,
+                     root_dirs: Optional[Dict[str, str]] = None):
     """
-    Функция для подготовки тренировочной и валидационной выборок.
+    Создаёт обучающую и валидационную выборки с настроенным пайплайном синхронных аугментаций.
     """
-    # ---- Пути к датасетам (заглушки — указать реальные пути) ----
-    DEEPGLOBE_ROOT = Path('/path/to/DeepGlobe_Land')                       # DeepGlobe Land Cover
-    LANDCOVERAI_ROOT = Path('/path/to/landcoverai')                        # LandCover.ai
-    GID_ROOT = Path('/path/to/GID')                                        # GID (Gaofen-2)
-    WHU_ROOT = Path('/path/to/WHU-OPT-SAR dataset')                        # WHU-OPT-SAR
-    DODW_ROOT = Path('/path/to/Dataset_Open_Dynamic_World_Test_Tiles')     # Open Dynamic World
-
-    from .semantic_sync_transforms import (
-        SyncRotate360_plus, SyncRandomHorizontalFlip, SyncRandomVerticalFlip,
-        SyncRandomBrightnessContrast
-    )
+    root_dirs = root_dirs or {}
     
+    DEEPGLOBE_ROOT = pathlib.Path(root_dirs.get('deepglobe', '/path/to/DeepGlobe_Land'))
+    LANDCOVERAI_ROOT = pathlib.Path(root_dirs.get('landcoverai', '/path/to/landcoverai'))
+    GID_ROOT = pathlib.Path(root_dirs.get('gid', '/path/to/GID'))
+    WHU_ROOT = pathlib.Path(root_dirs.get('whu', '/path/to/WHU-OPT-SAR dataset'))
+    DODW_ROOT = pathlib.Path(root_dirs.get('dodw', '/path/to/Dataset_Open_Dynamic_World_Test_Tiles'))
+
+    # Пайплайн аугментаций строго в установленном порядке
+    s_rbct = SyncRandomBrightnessContrastTarget()
+    sync_hor = SyncRandomHorizontalFlip()
+    sync_v = SyncRandomVerticalFlip()
+    sync_rot = SyncRotate360_plus(resolution=resolution)
+    sync_r_g_d = RandomGridDistortion()
+    sync_r_e_t = RandomElasticTransform()
+    sync_r_up_dwn = TrickyResize_UpDwn(resolution=resolution)
+    sync_aff_aug = AffineAugmentation(resolution=resolution)
+    sync_res = SyncResize(resolution=resolution)
+    sync_to_tens = SyncToTensor()
+    sync_noise = RandomNoiseSP()
+
     train_transforms = [
-        SyncRandomHorizontalFlip(p=0.5),
-        SyncRandomVerticalFlip(p=0.5),
-        SyncRotate360_plus(p=0.5, interpolation=Image.Resampling.BILINEAR),
-        SyncRandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        s_rbct,
+        sync_hor,
+        sync_v,
+        sync_rot,
+        sync_r_g_d,
+        sync_r_e_t,
+        sync_r_up_dwn,
+        sync_aff_aug,
+        sync_res,
+        sync_to_tens,
+        sync_noise,
     ]
-    val_transforms = []
+
+    val_transforms = [
+        sync_res,
+        sync_to_tens,
+    ]
 
     train_datasets = []
     val_datasets = []
@@ -579,20 +653,29 @@ def prepare_datasets(resolution=512, target_m_per_px=10.0,
 
 
 def segmentation_collate_fn(batch):
-    """Формирует батч для семантической сегментации.
+    """
+    Формирует батч для семантической сегментации.
     
     Returns:
         images: [B, 3, H, W] float tensor
-        masks: [B, H, W] long tensor with class indices 0..6
+        masks: [B, H, W] long tensor с индексами классов (0..6)
     """
     images = []
     masks = []
     for img, mask in batch:
-        if img.shape[0] == 1:
-            img = img.repeat(3, 1, 1)
-        elif img.shape[0] > 3:
-            img = img[:3]
+        if isinstance(img, torch.Tensor):
+            if img.ndim == 2:
+                img = img.unsqueeze(0).repeat(3, 1, 1)
+            elif img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
+            elif img.shape[0] > 3:
+                img = img[:3]
         
+        if isinstance(mask, torch.Tensor):
+            if mask.ndim == 3 and mask.shape[0] == 1:
+                mask = mask.squeeze(0)
+            mask = mask.long()
+            
         images.append(img)
         masks.append(mask)
 
