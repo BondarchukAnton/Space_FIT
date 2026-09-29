@@ -296,35 +296,107 @@ class DeepGlobeData(BasePatchDataset):
 
 
 class LandCoverAIData(BasePatchDataset):
+    """
+    Dataset для LandCover.ai. Загружает полноразмерные исходные ортофотопланы из images/ и маски из masks/
+    (формата GeoTIFF/TIF), масштабируя их с исходного разрешения (0.25 или 0.50 м/пикс) до целевого target_m_per_px.
+    """
     def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0, class_mapping=None):
         super().__init__(transforms, resolution)
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
         self.target_m_per_px = target_m_per_px
         self.class_mapping = class_mapping or LANDCOVERAI_CLASS_MAP
-        
-        self.native_gsd = 0.25
-        self.scale_factor = self.native_gsd / self.target_m_per_px
 
         self.files = []
-        img_dir = self.root_dir / f"{split}_images"
-        mask_dir = self.root_dir / f"{split}_masks"
-        if img_dir.exists() and mask_dir.exists():
-            for img_path in sorted(img_dir.glob("*.jpg")):
-                mask_name = img_path.stem + "_m.png"
-                mask_path = mask_dir / mask_name
-                if mask_path.exists():
-                    self.files.append((img_path, mask_path))
-
-        logger.info("Инициализация LandCoverAIData (%s): найдено %d пар.", split, len(self.files))
         
+        # 1. Поиск оригинальных полноразмерных снимков (images/ и masks/)
+        img_dir = self.root_dir / "images"
+        mask_dir = self.root_dir / "masks"
+        
+        if not img_dir.exists():
+            img_dir = self.root_dir
+        if not mask_dir.exists():
+            mask_dir = self.root_dir
+
+        all_pairs = []
+        if img_dir.exists() and mask_dir.exists():
+            for ext in ("*.tif", "*.tiff", "*.png", "*.jpg"):
+                for img_path in sorted(img_dir.glob(ext)):
+                    mask_path = None
+                    for m_ext in (".tif", ".tiff", ".png"):
+                        cand = mask_dir / f"{img_path.stem}{m_ext}"
+                        if cand.exists():
+                            mask_path = cand
+                            break
+                    if mask_path is not None:
+                        all_pairs.append((img_path, mask_path))
+
+        # 2. Разделение по сплитам
+        if all_pairs:
+            txt_file = self.root_dir / f"{split}.txt"
+            if not txt_file.exists() and split in ('val', 'valid', 'test'):
+                for alt_name in ('val.txt', 'test.txt'):
+                    cand = self.root_dir / alt_name
+                    if cand.exists():
+                        txt_file = cand
+                        break
+
+            if txt_file.exists():
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    tile_names = [line.strip() for line in f if line.strip()]
+                sheet_stems = set()
+                for name in tile_names:
+                    parts = name.rsplit('_', 1)
+                    sheet_stems.add(parts[0])
+
+                self.files = [(i, m) for i, m in all_pairs if i.stem in sheet_stems]
+                if not self.files:
+                    # Если имена файлов не совпали с перфиксом, используем процентный сплит
+                    num_train = int(len(all_pairs) * 0.8)
+                    self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
+            else:
+                num_train = int(len(all_pairs) * 0.8)
+                self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
+        else:
+            # Резервный вариант для локального тестирования с нарезанными тайлами
+            split_img_dir = self.root_dir / f"{split}_images"
+            split_mask_dir = self.root_dir / f"{split}_masks"
+            if split_img_dir.exists() and split_mask_dir.exists():
+                logger.warning(
+                    "Используются нарезанные тайлы LandCoverAI из %s вместо оригинальных GeoTIFF снимков.",
+                    split_img_dir
+                )
+                for img_path in sorted(split_img_dir.glob("*.jpg")):
+                    mask_name = img_path.stem + "_m.png"
+                    mask_path = split_mask_dir / mask_name
+                    if mask_path.exists():
+                        self.files.append((img_path, mask_path))
+
+        logger.info("Инициализация LandCoverAIData (%s): найдено %d полноразмерных снимков.", split, len(self.files))
+
         for i, (img_path, _) in enumerate(self.files):
-            with Image.open(img_path) as tmp:
-                w, h = tmp.size
-            sw, sh = max(1, int(w * self.scale_factor)), max(1, int(h * self.scale_factor))
+            w, h = self._get_image_size(img_path)
+            # 33 листа: ~8351..9243 × 9289..9715 (0.25 м/пикс), 8 листов: ~4113..4352 × 4672..4750 (0.50 м/пикс)
+            native_gsd = 0.25 if max(w, h) > 6000 else 0.50
+            scale_factor = native_gsd / self.target_m_per_px
+
+            sw, sh = max(1, int(w * scale_factor)), max(1, int(h * scale_factor))
             starts = compute_patch_starts(sw, sh, self.resolution)
             for px, py in starts:
                 self.patches.append((i, px, py))
+
+    def _get_image_size(self, img_path: pathlib.Path) -> Tuple[int, int]:
+        if img_path.suffix.lower() in ('.tif', '.tiff'):
+            try:
+                with tifffile.TiffFile(img_path) as tif:
+                    shape = tif.pages[0].shape
+                    if len(shape) >= 3 and shape[0] in (3, 4):
+                        return shape[2], shape[1]
+                    return shape[1], shape[0]
+            except Exception:
+                pass
+        with Image.open(img_path) as tmp:
+            return tmp.size
 
     def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
         cached = self.cache.get(idx_file)
@@ -332,23 +404,42 @@ class LandCoverAIData(BasePatchDataset):
             return cached
 
         img_path, mask_path = self.files[idx_file]
-        
-        img = Image.open(img_path).convert('RGB')
-        sw, sh = max(1, int(img.size[0] * self.scale_factor)), max(1, int(img.size[1] * self.scale_factor))
+
+        if img_path.suffix.lower() in ('.tif', '.tiff'):
+            img_arr = tifffile.imread(img_path)
+            if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
+                img_arr = np.transpose(img_arr, (1, 2, 0))
+            if img_arr.ndim == 3 and img_arr.shape[-1] >= 3:
+                img_arr = img_arr[:, :, :3]
+            img = Image.fromarray(img_arr, mode='RGB')
+        else:
+            img = Image.open(img_path).convert('RGB')
+
+        w, h = img.size
+        native_gsd = 0.25 if max(w, h) > 6000 else 0.50
+        scale_factor = native_gsd / self.target_m_per_px
+
+        sw, sh = max(1, int(w * scale_factor)), max(1, int(h * scale_factor))
         img = img.resize((sw, sh), Image.Resampling.LANCZOS)
 
-        mask = Image.open(mask_path)
-        mask_np = np.array(mask)
-        if mask_np.ndim == 3:
-            mask_np = mask_np[:, :, 0]
-            
-        idx_mask_np = apply_index_map(mask_np, self.class_mapping)
+        if mask_path.suffix.lower() in ('.tif', '.tiff'):
+            mask_arr = tifffile.imread(mask_path)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[:, :, 0] if mask_arr.shape[-1] < mask_arr.shape[0] else mask_arr[0, :, :]
+        else:
+            mask = Image.open(mask_path)
+            mask_arr = np.array(mask)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[:, :, 0]
+
+        idx_mask_np = apply_index_map(mask_arr, self.class_mapping)
         idx_mask = Image.fromarray(idx_mask_np, mode='L')
         idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
 
         res = (img, idx_mask)
         self.cache.put(idx_file, res)
         return res
+
 
 
 class GIDData(BasePatchDataset):
