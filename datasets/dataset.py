@@ -565,10 +565,12 @@ class WHUOptSarData(BasePatchDataset):
         img_path, mask_path = self.files[idx_file]
         
         img_arr = tifffile.imread(img_path)
-        if len(img_arr.shape) == 3 and img_arr.shape[0] in (3, 4):
+        if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
             img_arr = np.transpose(img_arr, (1, 2, 0))
-            
-        rgb_arr = img_arr[:, :, [0, 1, 2]]
+
+        # Согласно Who_opt_sar_info.md, каналы идут в порядке BGR+NIR: 0=Blue, 1=Green, 2=Red, 3=NIR.
+        # Для получения правильного RGB формата выбираем каналы [2, 1, 0] (Red, Green, Blue).
+        rgb_arr = img_arr[:, :, [2, 1, 0]]
         img = Image.fromarray(rgb_arr, mode='RGB')
         sw, sh = max(1, int(img.size[0] * self.scale_factor)), max(1, int(img.size[1] * self.scale_factor))
         img = img.resize((sw, sh), Image.Resampling.LANCZOS)
