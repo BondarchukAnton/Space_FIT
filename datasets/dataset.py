@@ -300,152 +300,170 @@ class DeepGlobeData(BasePatchDataset):
         return res
 
 
-class LandCoverAIData(BasePatchDataset):
-    """
-    Dataset для LandCover.ai. Загружает полноразмерные исходные ортофотопланы из images/ и маски из masks/
-    (формата GeoTIFF/TIF), масштабируя их с исходного разрешения (0.25 или 0.50 м/пикс) до целевого target_m_per_px.
+class LandCoverAIData(Dataset):
+    """Целые исходные снимки images/ + masks/, только для обучения.
+
+    Списки тайлов *.txt не используются. После масштабирования большие
+    снимки нарезаются на патчи, маленькие дополняются фоном по центру.
+    overlap — доля перекрытия [0, 1), по умолчанию 0.25.
+    Последний патч прижимается к краю: его перекрытие может быть больше.
+
+    native_gsd: при необходимости задайте явно м/пикс для всех снимков.
+    По умолчанию сохранена эвристика исходного кода для оригиналов
+    LandCover.ai: 0.25 при max(w, h) > 6000, иначе 0.50.
     """
 
-    def __init__(self, root_dir, split='train', transforms=None, resolution=512, target_m_per_px=10.0,
-                 class_mapping=None):
-        super().__init__(transforms, resolution)
+    def __init__(self, root_dir, split='train', transforms=None,
+                 resolution=512, target_m_per_px=10.0,
+                 class_mapping=None, native_gsd=None, overlap=0.25):
+        if split not in ('train', 'val', 'valid', 'test'):
+            raise ValueError(f'Неизвестная выборка: {split}')
+        if not isinstance(resolution, int) or isinstance(resolution, bool):
+            raise ValueError('resolution должен быть целым числом')
+        if not 0 <= overlap < 1:
+            raise ValueError('overlap должен быть в диапазоне [0, 1)')
+        if resolution <= 0 or target_m_per_px <= 0:
+            raise ValueError('resolution и target_m_per_px должны быть > 0')
+        if native_gsd is not None and native_gsd <= 0:
+            raise ValueError('native_gsd должен быть > 0')
+
         self.root_dir = pathlib.Path(root_dir)
         self.split = split
+        self.transforms = transforms or []
+        self.resolution = resolution
         self.target_m_per_px = target_m_per_px
-        self.class_mapping = class_mapping or LANDCOVERAI_CLASS_MAP
-
+        self.native_gsd = native_gsd
+        self.class_mapping = (
+            LANDCOVERAI_CLASS_MAP if class_mapping is None else class_mapping
+        )
+        self.overlap = overlap
+        self.stride = max(1, round(resolution * (1 - overlap)))
+        self.patches = []  # (индекс файла, x, y)
         self.files = []
+        self.cache = LRUImageCache(maxsize=8)
 
-        # 1. Поиск оригинальных полноразмерных снимков (images/ и masks/)
-        img_dir = self.root_dir / "images"
-        mask_dir = self.root_dir / "masks"
+        # В общей папке нет разделения исходных снимков по выборкам.
+        # Оставляем пустой объект для совместимости с prepare_datasets.
+        if split != 'train':
+            logger.info('LandCoverAIData (%s): 0 снимков; источник только для train.', split)
+            return
 
-        if not img_dir.exists():
-            img_dir = self.root_dir
-        if not mask_dir.exists():
-            mask_dir = self.root_dir
+        img_dir = self.root_dir / 'images'
+        mask_dir = self.root_dir / 'masks'
+        if not img_dir.is_dir() or not mask_dir.is_dir():
+            raise FileNotFoundError(f'Ожидаются папки {img_dir} и {mask_dir}')
 
-        all_pairs = []
-        if img_dir.exists() and mask_dir.exists():
-            for ext in ("*.tif", "*.tiff", "*.png", "*.jpg"):
-                for img_path in sorted(img_dir.glob(ext)):
-                    mask_path = None
-                    for m_ext in (".tif", ".tiff", ".png"):
-                        cand = mask_dir / f"{img_path.stem}{m_ext}"
-                        if cand.exists():
-                            mask_path = cand
-                            break
-                    if mask_path is not None:
-                        all_pairs.append((img_path, mask_path))
+        extensions = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
+        masks_by_stem = {}
+        for path in sorted(mask_dir.iterdir()):
+            if path.is_file() and path.suffix.lower() in {'.tif', '.tiff', '.png'}:
+                if path.stem in masks_by_stem:
+                    raise ValueError(f'Несколько масок с именем {path.stem}')
+                masks_by_stem[path.stem] = path
 
-        # 2. Разделение по сплитам
-        if all_pairs:
-            txt_file = self.root_dir / f"{split}.txt"
-            if not txt_file.exists() and split in ('val', 'valid', 'test'):
-                for alt_name in ('val.txt', 'test.txt'):
-                    cand = self.root_dir / alt_name
-                    if cand.exists():
-                        txt_file = cand
-                        break
+        for path in sorted(img_dir.iterdir()):
+            if path.is_file() and path.suffix.lower() in extensions:
+                if path.stem not in masks_by_stem:
+                    raise FileNotFoundError(f'Не найдена маска для {path.name}')
+                self.files.append((path, masks_by_stem[path.stem]))
 
-            if txt_file.exists():
-                with open(txt_file, 'r', encoding='utf-8') as f:
-                    tile_names = [line.strip() for line in f if line.strip()]
-                sheet_stems = set()
-                for name in tile_names:
-                    parts = name.rsplit('_', 1)
-                    sheet_stems.add(parts[0])
-
-                self.files = [(i, m) for i, m in all_pairs if i.stem in sheet_stems]
-                if not self.files:
-                    # Если имена файлов не совпали с перфиксом, используем процентный сплит
-                    num_train = int(len(all_pairs) * 0.95)
-                    self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
-            else:
-                num_train = int(len(all_pairs) * 0.95)
-                self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
-        else:
-            # Резервный вариант для локального тестирования с нарезанными тайлами
-            split_img_dir = self.root_dir / f"{split}_images"
-            split_mask_dir = self.root_dir / f"{split}_masks"
-            if split_img_dir.exists() and split_mask_dir.exists():
-                logger.warning(
-                    "Используются нарезанные тайлы LandCoverAI из %s вместо оригинальных GeoTIFF снимков.",
-                    split_img_dir
-                )
-                for img_path in sorted(split_img_dir.glob("*.jpg")):
-                    mask_name = img_path.stem + "_m.png"
-                    mask_path = split_mask_dir / mask_name
-                    if mask_path.exists():
-                        self.files.append((img_path, mask_path))
-
-        logger.info("Инициализация LandCoverAIData (%s): найдено %d полноразмерных снимков.", split, len(self.files))
-
-        for i, (img_path, _) in enumerate(self.files):
+        if not self.files:
+            raise ValueError(f'В {img_dir} не найдены исходные снимки')
+        for file_idx, (img_path, _) in enumerate(self.files):
             w, h = self._get_image_size(img_path)
-            # 33 листа: ~8351..9243 × 9289..9715 (0.25 м/пикс), 8 листов: ~4113..4352 × 4672..4750 (0.50 м/пикс)
-            native_gsd = 0.25 if max(w, h) > 6000 else 0.50
-            scale_factor = native_gsd / self.target_m_per_px
+            sw, sh = self._scaled_size(w, h)
+            for y in self._axis_starts(sh):
+                for x in self._axis_starts(sw):
+                    self.patches.append((file_idx, x, y))
+        logger.info('LandCoverAIData (train): %d снимков, %d примеров.',
+                    len(self.files), len(self.patches))
 
-            sw, sh = max(1, int(w * scale_factor)), max(1, int(h * scale_factor))
-            starts = compute_patch_starts(sw, sh, self.resolution)
-            for px, py in starts:
-                self.patches.append((i, px, py))
+    def __len__(self):
+        return len(self.patches)
 
-    def _get_image_size(self, img_path: pathlib.Path) -> Tuple[int, int]:
-        if img_path.suffix.lower() in ('.tif', '.tiff'):
-            try:
-                with tifffile.TiffFile(img_path) as tif:
-                    shape = tif.pages[0].shape
-                    if len(shape) >= 3 and shape[0] in (3, 4):
-                        return shape[2], shape[1]
-                    return shape[1], shape[0]
-            except Exception:
-                pass
-        with Image.open(img_path) as tmp:
-            return tmp.size
+    def _axis_starts(self, length):
+        if length <= self.resolution:
+            return [0]
+        last = length - self.resolution
+        starts = list(range(0, last + 1, self.stride))
+        if starts[-1] != last:
+            starts.append(last)
+        return starts
 
-    def _get_scaled_image_and_mask(self, idx_file: int) -> Tuple[Image.Image, Image.Image]:
+    @staticmethod
+    def _get_image_size(path):
+        if path.suffix.lower() in ('.tif', '.tiff'):
+            with tifffile.TiffFile(path) as tif:
+                shape = tif.series[0].shape
+            if len(shape) == 3 and shape[0] in (3, 4):
+                return shape[2], shape[1]
+            return shape[1], shape[0]
+        with Image.open(path) as img:
+            return img.size
+
+    def _scaled_size(self, w, h):
+        gsd = self.native_gsd
+        if gsd is None:
+            gsd = 0.25 if max(w, h) > 6000 else 0.50
+        factor = gsd / self.target_m_per_px
+        return max(1, int(w * factor)), max(1, int(h * factor))
+
+    @staticmethod
+    def _read_array(path):
+        if path.suffix.lower() in ('.tif', '.tiff'):
+            return tifffile.imread(path)
+        with Image.open(path) as image:
+            return np.array(image)
+
+    def _get_scaled_image_and_mask(self, idx_file):
         cached = self.cache.get(idx_file)
         if cached is not None:
             return cached
 
         img_path, mask_path = self.files[idx_file]
+        img_arr = self._read_array(img_path)
+        if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
+            img_arr = np.transpose(img_arr, (1, 2, 0))
+        if img_arr.ndim != 3 or img_arr.shape[-1] not in (3, 4):
+            raise ValueError(f'Ожидается RGB/RGBA: {img_path}, shape={img_arr.shape}')
+        if img_arr.dtype != np.uint8:
+            raise ValueError(f'Ожидается uint8 RGB: {img_path}, dtype={img_arr.dtype}')
+        img = Image.fromarray(img_arr[..., :3])
 
-        if img_path.suffix.lower() in ('.tif', '.tiff'):
-            img_arr = tifffile.imread(img_path)
-            if img_arr.ndim == 3 and img_arr.shape[0] in (3, 4):
-                img_arr = np.transpose(img_arr, (1, 2, 0))
-            if img_arr.ndim == 3 and img_arr.shape[-1] >= 3:
-                img_arr = img_arr[:, :, :3]
-            img = Image.fromarray(img_arr, mode='RGB')
-        else:
-            img = Image.open(img_path).convert('RGB')
-
+        mask_arr = self._read_array(mask_path)
+        if mask_arr.ndim == 3 and mask_arr.shape[-1] == 1:
+            mask_arr = mask_arr[..., 0]
+        elif mask_arr.ndim == 3 and mask_arr.shape[0] == 1:
+            mask_arr = mask_arr[0]
+        if mask_arr.ndim != 2:
+            raise ValueError(f'Ожидается индексная 2D-маска: {mask_path}, shape={mask_arr.shape}')
         w, h = img.size
-        native_gsd = 0.25 if max(w, h) > 6000 else 0.50
-        scale_factor = native_gsd / self.target_m_per_px
+        if mask_arr.shape != (h, w):
+            raise ValueError(f'Размеры изображения и маски не совпадают: {img_path.name}')
 
-        sw, sh = max(1, int(w * scale_factor)), max(1, int(h * scale_factor))
-        img = img.resize((sw, sh), Image.Resampling.LANCZOS)
+        size = self._scaled_size(w, h)
 
-        if mask_path.suffix.lower() in ('.tif', '.tiff'):
-            mask_arr = tifffile.imread(mask_path)
-            if mask_arr.ndim == 3:
-                mask_arr = mask_arr[:, :, 0] if mask_arr.shape[-1] < mask_arr.shape[0] else mask_arr[0, :, :]
-        else:
-            mask = Image.open(mask_path)
-            mask_arr = np.array(mask)
-            if mask_arr.ndim == 3:
-                mask_arr = mask_arr[:, :, 0]
+        img = img.resize(size, Image.Resampling.LANCZOS)
+        mask = Image.fromarray(apply_index_map(mask_arr, self.class_mapping))
+        mask = mask.resize(size, Image.Resampling.NEAREST)
+        result = (img, mask)
+        self.cache.put(idx_file, result)
+        return result
 
-        idx_mask_np = apply_index_map(mask_arr, self.class_mapping)
-        idx_mask = Image.fromarray(idx_mask_np, mode='L')
-        idx_mask = idx_mask.resize((sw, sh), Image.Resampling.NEAREST)
+    def __getitem__(self, idx):
+        file_idx, x, y = self.patches[idx]
+        img, mask = self._get_scaled_image_and_mask(file_idx)
+        # Не выходим за границы: иначе PIL добавит нули справа/снизу
+        # ещё до центрированного дополнения.
+        box = (x, y, min(x + self.resolution, img.width),
+               min(y + self.resolution, img.height))
+        img = pad_image_centered(img.crop(box), self.resolution)
+        mask = pad_mask_centered(mask.crop(box), self.resolution)
 
-        res = (img, idx_mask)
-        self.cache.put(idx_file, res)
-        return res
+        if self.transforms:
+            transforms = SyncCompose(n_e_augs_shuffle(self.transforms))
+            return transforms(img=img, mask=mask)
+        return SyncToTensor()(img=img, mask=mask)
 
 
 class GIDData(BasePatchDataset):
