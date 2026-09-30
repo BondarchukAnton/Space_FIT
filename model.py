@@ -26,7 +26,7 @@ def create_model(
     encoder_name: str = 'tu-maxvit_base_tf_512',
     encoder_weights: str = 'imagenet',
     in_channels: int = 3,
-    num_classes: int = 7,
+    num_classes: int = 6,
     activation: Optional[str] = None,
 ) -> nn.Module:
     """
@@ -64,7 +64,7 @@ def load_model(
     architecture: str = 'UnetPlusPlus',
     encoder_name: str = 'tu-maxvit_base_tf_512',
     in_channels: int = 3,
-    num_classes: int = 7,
+    num_classes: int = 6,
 ) -> nn.Module:
     """
     Загрузка модели с весами из указанного файла (чекпоинта).

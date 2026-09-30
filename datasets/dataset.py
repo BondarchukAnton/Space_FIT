@@ -33,7 +33,7 @@ from .semantic_sync_transforms import (
 
 logger = logging.getLogger(__name__)
 
-NUM_TARGET_CLASSES = 7
+NUM_TARGET_CLASSES = 6
 TARGET_CLASS_NAMES = {
     0: 'Фон',                    # Background (no scene)
     1: 'Лесной массив',          # Forest
@@ -41,7 +41,6 @@ TARGET_CLASS_NAMES = {
     3: 'Водоём',                 # Water
     4: 'Городская территория',   # Urban
     5: 'Горный район',           # Mountain
-    6: 'Прочее',                 # Other
 }
 
 # Маппинги для датасетов
@@ -49,7 +48,7 @@ DEEPGLOBE_COLOR_MAP = {
     (0, 0, 0): 0,        # unknown → Фон
     (0, 255, 255): 4,    # urban_land → Городская территория
     (255, 255, 0): 2,    # agriculture_land → Поле
-    (255, 0, 255): 2,    # rangeland → Прочее
+    (255, 0, 255): 2,    # rangeland → Поле
     (0, 255, 0): 1,      # forest_land → Лесной массив
     (0, 0, 255): 3,      # water → Водоём
     (255, 255, 255): 5,  # barren_land → Горный район
@@ -60,7 +59,7 @@ LANDCOVERAI_CLASS_MAP = {
     1: 4,  # Building → Городская территория
     2: 1,  # Woodland → Лесной массив
     3: 3,  # Water → Водоём
-    4: 6,  # Road → Городская территория
+    4: 0,  # Road → Фон
 }
 
 GID_COLOR_MAP = {
@@ -68,7 +67,7 @@ GID_COLOR_MAP = {
     (255, 0, 0): 4,      # built-up → Городская территория
     (0, 255, 0): 2,      # farmland → Поле
     (0, 255, 255): 1,    # forest → Лесной массив
-    (255, 255, 0): 2,    # meadow → Прочее
+    (255, 255, 0): 2,    # meadow → Поле
     (0, 0, 255): 3,      # water → Водоём
 }
 
@@ -79,20 +78,20 @@ WHU_CLASS_MAP = {
     30: 4,   # Village → Городская территория
     40: 3,   # Water → Водоём
     50: 1,   # Forest → Лесной массив
-    60: 6,   # Road → Городская территория
-    70: 6,   # Others → Прочее
+    60: 0,   # Road → Фон
+    70: 0,   # Others → Фон
 }
 
 DODW_CLASS_MAP = {
     0: 3,   # water → Водоём
     1: 1,   # trees → Лесной массив
-    2: 2,   # grass → Прочее
-    3: 3,   # flooded_vegetation → Прочее
+    2: 2,   # grass → Поле
+    3: 3,   # flooded_vegetation → Водоём
     4: 2,   # crops → Поле
-    5: 2,   # shrub_and_scrub → Прочее
+    5: 2,   # shrub_and_scrub → Поле
     6: 4,   # built → Городская территория
     7: 5,   # bare → Горный район
-    8: 6,   # snow_and_ice → Горный район
+    8: 0,   # snow_and_ice → Фон
 }
 
 
@@ -165,7 +164,7 @@ def compute_patch_starts(w: int, h: int, patch_size: int) -> List[Tuple[int, int
 
 
 def apply_color_map(mask_np: np.ndarray, color_map: Dict[Tuple[int, int, int], int]) -> np.ndarray:
-    """Векторизованное преобразование RGB-маски в одноканальные индексы классов (0..6)."""
+    """Векторизованное преобразование RGB-маски в одноканальные индексы классов (0..5)."""
     out = np.zeros((mask_np.shape[0], mask_np.shape[1]), dtype=np.uint8)
     for color, class_idx in color_map.items():
         match = (mask_np[:, :, 0] == color[0]) & \
@@ -176,7 +175,7 @@ def apply_color_map(mask_np: np.ndarray, color_map: Dict[Tuple[int, int, int], i
 
 
 def apply_index_map(mask_np: np.ndarray, index_map: Dict[int, int]) -> np.ndarray:
-    """Векторизованный перемаппинг исходных индексов в единые индексы классов (0..6)."""
+    """Векторизованный перемаппинг исходных индексов в единые индексы классов (0..5)."""
     out = np.zeros_like(mask_np, dtype=np.uint8)
     for in_idx, out_idx in index_map.items():
         out[mask_np == in_idx] = out_idx
@@ -775,7 +774,7 @@ def segmentation_collate_fn(batch):
 
     Returns:
         images: [B, 3, H, W] float tensor
-        masks: [B, H, W] long tensor с индексами классов (0..6)
+        masks: [B, H, W] long tensor с индексами классов (0..5)
     """
     images = []
     masks = []

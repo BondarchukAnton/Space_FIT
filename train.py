@@ -60,8 +60,14 @@ WRITER_EPOCH = 1
 start_epoch = 1
 EPOCHS = 50
 resolution = 512
-LABEL = 'UnetPP_maxvit_7cls_512'
-continue_with = None  # Путь к чекпоинту для продолжения
+LABEL = 'UnetPP_maxvit_6cls_512'
+
+# ---- Параметры дообучения / возобновления обучения ----
+PRETRAINED_PATH = None       # Путь к чекпоинту предобученной модели (None — обучение без чекпоинта)
+SAME_NUM_CLASSES = False     # True — одинаковое число классов (полная загрузка модели),
+                             # False — разное число классов (загрузка весов только в общие слои до слоя классификации)
+RESUME_TRAINING = False      # True — продолжить обучение (восстановить оптимизатор, планировщик и эпоху),
+                             # False — только взять веса модели и начать обучение заново с 1-й эпохи
 
 train_dataset, val_dataset = prepare_datasets(resolution=resolution, target_m_per_px=10.0)
 
@@ -143,16 +149,66 @@ class ComboLoss(nn.Module):
 criterion = ComboLoss(num_classes=NUM_TARGET_CLASSES, weights={'dice': 0.6, 'ce': 0.3, 'focal': 0.1}).cuda()
 scaler = torch.amp.GradScaler('cuda')
 
-if continue_with:
-    checkpoint = torch.load(continue_with, weights_only=False, map_location='cuda')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    if 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if 'scheduler' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler'])
-    if 'epoch' in checkpoint:
-        start_epoch = checkpoint['epoch'] + 1
-    print('Веса загружены успешно')
+if PRETRAINED_PATH:
+    print(f'Загрузка предобученной модели из: {PRETRAINED_PATH}')
+    checkpoint = torch.load(PRETRAINED_PATH, weights_only=False, map_location='cuda')
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+
+    # Убираем префикс 'module.', если модель сохранялась через DataParallel/DDP
+    state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+
+    if SAME_NUM_CLASSES:
+        # Количество классов совпадает: загружаем модель полностью
+        model.load_state_dict(state_dict)
+        print('Все веса модели (включая классификатор) успешно загружены')
+    else:
+        # Количество классов отличается: загружаем веса только в общие слои до слоя классификации (encoder, decoder).
+        # Слой классификации (segmentation_head) исключается, так как его размерность зависит от числа классов,
+        # и он обучается заново под текущее количество классов (NUM_TARGET_CLASSES).
+        common_weights = {
+            k: v for k, v in state_dict.items()
+            if not k.startswith('segmentation_head.')
+        }
+        msg = model.load_state_dict(common_weights, strict=False)
+        print('Веса общих слоев (encoder, decoder) успешно загружены до слоя классификации')
+        print(f'Слой классификации (segmentation_head) инициализирован заново под {NUM_TARGET_CLASSES} классов')
+        if msg.missing_keys:
+            print(f'Пропущенные ключи (классификатор): {msg.missing_keys}')
+
+    if RESUME_TRAINING:
+        if not SAME_NUM_CLASSES:
+            print('Внимание: RESUME_TRAINING=True, но SAME_NUM_CLASSES=False (число классов отличается).')
+            print('Состояние оптимизатора и планировщика несовместимо с новой структурой классификатора.')
+            print('Обучение начнется заново с 1-й эпохи с новым оптимизатором и планировщиком.')
+            start_epoch = 1
+        else:
+            missing_items = []
+            if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print('Состояние оптимизатора успешно восстановлено из чекпоинта')
+            else:
+                missing_items.append('optimizer_state_dict')
+
+            if isinstance(checkpoint, dict) and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+                print('Состояние планировщика (scheduler) успешно восстановлено из чекпоинта')
+            else:
+                missing_items.append('scheduler')
+
+            if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                print(f'Номер эпохи восстановлен: продолжение обучения с эпохи {start_epoch}')
+            else:
+                missing_items.append('epoch')
+                start_epoch = 1
+
+            if missing_items:
+                print(f'Информация: в чекпоинте отсутствуют следующие данные: {", ".join(missing_items)}.')
+                if 'epoch' in missing_items:
+                    print('Обучение начнется с 1-й эпохи.')
+    else:
+        print('RESUME_TRAINING=False: загружены только веса модели, обучение начинается заново с 1-й эпохи')
+        start_epoch = 1
 
 logs_root = Path('/mnt/980EAB530EAB2968/hdd_logs/OtherProject/SPACE')
 experiment_dir = logs_root / LABEL
@@ -167,7 +223,6 @@ TARGET_COLORS = {
     3: (0, 0, 255),    # Водоём — синий
     4: (255, 0, 0),     # Городская территория — красный
     5: (255, 0, 255),     # Горный район — фиолетовый
-    6: (255, 255, 255),   # Прочее — белый
 }
 
 def build_vis_image(X_vis, y_vis, output_vis, resolution):
