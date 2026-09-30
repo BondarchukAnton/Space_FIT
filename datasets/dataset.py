@@ -359,10 +359,10 @@ class LandCoverAIData(BasePatchDataset):
                 self.files = [(i, m) for i, m in all_pairs if i.stem in sheet_stems]
                 if not self.files:
                     # Если имена файлов не совпали с перфиксом, используем процентный сплит
-                    num_train = int(len(all_pairs) * 0.8)
+                    num_train = int(len(all_pairs) * 0.95)
                     self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
             else:
-                num_train = int(len(all_pairs) * 0.8)
+                num_train = int(len(all_pairs) * 0.95)
                 self.files = all_pairs[:num_train] if split == 'train' else all_pairs[num_train:]
         else:
             # Резервный вариант для локального тестирования с нарезанными тайлами
@@ -622,7 +622,7 @@ class DODWData(BasePatchDataset):
                 if mask_path.exists():
                     all_files.append((img_path, mask_path))
 
-        num_train = int(len(all_files) * 0.8)
+        num_train = int(len(all_files) * 0.95)
         if split == 'train':
             self.files = all_files[:num_train]
         else:

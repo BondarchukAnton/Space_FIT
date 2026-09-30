@@ -413,7 +413,7 @@ class SyncRotate360_plus():
                         rand_size_up = np.array([int((w * lenimg) / 100), int((h * lenimg) / 100)])
                         interpolation = choice(imodes)
                         img_r = F.resize(img_r, tuple(rand_size_up), interpolation=interpolation, antialias=True)
-                        mask_r = F.resize(mask_r, tuple(rand_size_up), interpolation=interpolation, antialias=True)
+                        mask_r = F.resize(mask_r, tuple(rand_size_up), interpolation=IMode.NEAREST, antialias=True)
                         w, h = img_r.size
 
                     delt_sz1 = (((w * 142) / 100) - w) // 2
@@ -434,7 +434,7 @@ class SyncRotate360_plus():
                 rand_size_up = np.array([int((w * lenimg) / 100), int((h * lenimg) / 100)])
                 interpolation = choice(imodes)
                 img = F.resize(img, tuple(rand_size_up), interpolation=interpolation, antialias=True)
-                mask = F.resize(mask, tuple(rand_size_up), interpolation=interpolation, antialias=True)
+                mask = F.resize(mask, tuple(rand_size_up), interpolation=IMode.NEAREST, antialias=True)
 
             delt_sz1 = (((w * 142) / 100) - w) // 2
             delt_sz2 = (((h * 142) / 100) - h) // 2
