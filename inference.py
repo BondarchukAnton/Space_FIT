@@ -1,141 +1,238 @@
+import os
+import logging
+from typing import List, Dict, Optional, Union, Tuple
 import numpy as np
 import torch
-import math
-import logging
-from typing import List, Dict, Optional, Union
-
-from datasets.dataset import NUM_TARGET_CLASSES, TARGET_CLASS_NAMES
-from model import create_model
 import segmentation_models_pytorch as smp
 
-logger = logging.getLogger(__name__)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("SegmentationInference")
+
+# ---------------------------------------------------------------------------
+# Конфигурация по умолчанию
+# ---------------------------------------------------------------------------
+DEFAULT_CHECKPOINT_PATH = "/mnt/980EAB530EAB2968/hdd_logs/OtherProject/SPACE/UnetPP_maxvit_6cls_512/top_model.pt"
+
+NUM_TARGET_CLASSES = 6
+TARGET_CLASS_NAMES = {
+    0: 'Фон',                    # Background (no scene)
+    1: 'Лесной массив',          # Forest
+    2: 'Поле',                   # Field/Agriculture
+    3: 'Водоём',                 # Water
+    4: 'Городская территория',   # Urban
+    5: 'Горный район',           # Mountain
+}
+
+CLASS_COLORS: Dict[int, Tuple[int, int, int]] = {
+    0: (0, 0, 0),         # Фон — чёрный
+    1: (0, 255, 0),     # Лесной массив — зелёный
+    2: (255, 255, 0),     # Поле — золотой
+    3: (0, 0, 255),    # Водоём — синий
+    4: (255, 0, 0),     # Городская территория — красный
+    5: (255, 0, 255),     # Горный район — фиолетовый
+}
 
 
 class SegmentationModel:
     """
-    Класс для выполнения логического вывода (инференса) модели сегментации.
+    Автономный класс для выполнения инференса модели сегментации.
+    Не требует сторонних модулей проекта и подключения к интернету.
     """
 
     def __init__(
-        self,
-        checkpoint_path: str,
-        device: str = 'cuda',
+            self,
+            checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
+            device: Optional[str] = None,
+            num_classes: int = NUM_TARGET_CLASSES,
+            tile_size: int = 512,
+            overlap: int = 64,
     ) -> None:
         """
-        Инициализация модели сегментации.
-        """
-        self.device = torch.device(device)
-        self.num_classes = NUM_TARGET_CLASSES
+        Инициализация и загрузка весов.
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
-        self.model = create_model(
-            architecture='UnetPlusPlus',
+        Args:
+            checkpoint_path: Путь к файлу весов (.pt / .pth).
+            device: 'cuda', 'cpu' или None (автовыбор).
+            num_classes: Количество выходных классов.
+            tile_size: Размер окна тайлинга (по умолчанию 512).
+            overlap: Перекрытие между соседними окнами.
+        """
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        self.num_classes = num_classes
+        self.tile_size = tile_size
+        self.overlap = overlap
+
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Файл весов не найден по пути: {checkpoint_path}")
+
+        # Создание архитектуры БЕЗ обращения к интернету (encoder_weights=None)
+        self.model = smp.UnetPlusPlus(
             encoder_name='tu-maxvit_base_tf_512',
+            encoder_weights=None,  # Исключает попытки скачать imagenet-веса из сети
             in_channels=3,
-            num_classes=self.num_classes
+            classes=self.num_classes,
+            activation=None,
         ).to(self.device)
-        
+
+        # Загрузка обученных весов
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+
+        # Очистка префикса 'module.' если модель сохранялась через DataParallel
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
         self.model.load_state_dict(state_dict)
-        
         self.model.eval()
 
-        preprocess_params = smp.encoders.get_preprocessing_params('tu-maxvit_base_tf_512')
-        self.mean = np.array(preprocess_params['mean'], dtype=np.float32)
-        self.std = np.array(preprocess_params['std'], dtype=np.float32)
-        
-        logger.info(f"Модель успешно загружена из {checkpoint_path} на {self.device}")
+        # Статистики нормализации (стандарт ImageNet для maxvit_base_tf_512)
+        try:
+            params = smp.encoders.get_preprocessing_params('tu-maxvit_base_tf_512')
+            self.mean = np.array(params['mean'], dtype=np.float32)
+            self.std = np.array(params['std'], dtype=np.float32)
+        except Exception:
+            self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        logger.info(f"Модель успешно загружена из {checkpoint_path} на устройство {self.device}")
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
         """
-        Предобработка изображения: приведение осей, нормализация.
+        Предобработка: приведение к формату float32, диапазону [0, 1], CHW и нормализация.
         """
         if image.ndim != 3:
-            raise ValueError(f"Ожидается трехмерный массив, получено {image.ndim} измерений")
+            raise ValueError(f"Ожидается трехмерный массив (H, W, C) или (C, H, W), получено: {image.shape}")
 
-        if image.shape[2] == 3:
-            image = np.transpose(image, (2, 0, 1))
-        elif image.shape[0] != 3:
-            raise ValueError(f"Ожидается 3 спектральных каналов, получена форма {image.shape}")
+        img = image.copy()
 
-        if image.dtype != np.float32:
-            image = image.astype(np.float32)
+        # Приведение к порядку каналов CHW
+        if img.shape[2] == 3:
+            img = np.transpose(img, (2, 0, 1))
+        elif img.shape[0] != 3:
+            raise ValueError(f"Ожидается 3 спектральных канала (RGB), получена форма: {img.shape}")
 
-        if image.max() > 1.0:
-            image /= 255.0
+        if img.dtype != np.float32:
+            img = img.astype(np.float32)
+
+        if img.max() > 1.0:
+            img /= 255.0
 
         for i in range(3):
-            image[i] = (image[i] - self.mean[i]) / self.std[i]
+            img[i] = (img[i] - self.mean[i]) / self.std[i]
 
-        return image
+        return img
+
+    @staticmethod
+    def _compute_steps(length: int, tile: int, stride: int) -> List[int]:
+        """Генерация координат скользящего окна без выхода за границы."""
+        if length <= tile:
+            return [0]
+        steps = list(range(0, length - tile + 1, stride))
+        if steps[-1] + tile < length:
+            steps.append(length - tile)
+        return steps
 
     def predict_proba(self, image: np.ndarray) -> np.ndarray:
         """
-        Предсказание вероятностей классов для изображения произвольного размера.
+        Предсказание карты вероятностей классов для изображения произвольного размера.
+
+        Args:
+            image: массив (H, W, 3) или (3, H, W) в RGB.
+
+        Returns:
+            Карта вероятностей shape (num_classes, H, W), dtype float32.
         """
         image_proc = self._preprocess(image)
-        c, h, w = image_proc.shape
-        
-        tile_size = 512
-        overlap = 64
-        stride = tile_size - overlap
+        _, h, w = image_proc.shape
 
-        pad_h = (tile_size - h % tile_size) % tile_size
-        pad_w = (tile_size - w % tile_size) % tile_size
-        
+        stride = self.tile_size - self.overlap
+
+        # Паддинг только если изображение меньше минимального размера окна сети
+        pad_h = max(0, self.tile_size - h)
+        pad_w = max(0, self.tile_size - w)
+
         if pad_h > 0 or pad_w > 0:
             image_proc = np.pad(image_proc, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
-            
-        padded_h, padded_w = image_proc.shape[1:]
-        
-        probs = np.zeros((self.num_classes, padded_h, padded_w), dtype=np.float32)
-        weight_map = np.zeros((1, padded_h, padded_w), dtype=np.float32)
-        
-        y_steps = range(0, padded_h - tile_size + 1, stride) if padded_h >= tile_size else [0]
-        x_steps = range(0, padded_w - tile_size + 1, stride) if padded_w >= tile_size else [0]
-        
-        if padded_h < tile_size or padded_w < tile_size:
-            y_steps, x_steps = [0], [0]
-            target_h = max(tile_size, padded_h)
-            target_w = max(tile_size, padded_w)
-            image_proc = np.pad(image_proc, ((0, 0), (0, target_h - padded_h), (0, target_w - padded_w)), mode='reflect')
-            probs = np.zeros((self.num_classes, target_h, target_w), dtype=np.float32)
-            weight_map = np.zeros((1, target_h, target_w), dtype=np.float32)
+
+        cur_h, cur_w = image_proc.shape[1], image_proc.shape[2]
+
+        y_steps = self._compute_steps(cur_h, self.tile_size, stride)
+        x_steps = self._compute_steps(cur_w, self.tile_size, stride)
+
+        probs = np.zeros((self.num_classes, cur_h, cur_w), dtype=np.float32)
+        weight_map = np.zeros((1, cur_h, cur_w), dtype=np.float32)
 
         with torch.no_grad():
             for y in y_steps:
                 for x in x_steps:
-                    tile = image_proc[:, y:y+tile_size, x:x+tile_size]
+                    tile = image_proc[:, y:y + self.tile_size, x:x + self.tile_size]
                     tile_tensor = torch.from_numpy(tile).unsqueeze(0).to(self.device)
-                    
+
                     logits = self.model(tile_tensor)
                     tile_probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-                    
-                    probs[:, y:y+tile_size, x:x+tile_size] += tile_probs
-                    weight_map[:, y:y+tile_size, x:x+tile_size] += 1.0
+
+                    probs[:, y:y + self.tile_size, x:x + self.tile_size] += tile_probs
+                    weight_map[:, y:y + self.tile_size, x:x + self.tile_size] += 1.0
 
         probs /= weight_map
-        probs = probs[:, :h, :w]
-        
-        return probs
+        return probs[:, :h, :w]
 
     def predict(self, image: np.ndarray) -> np.ndarray:
         """
-        Предсказание маски сегментации для изображения.
+        Получение дискретной маски сегментации (индексы классов 0..N-1).
+
+        Args:
+            image: массив (H, W, 3) или (3, H, W).
+
+        Returns:
+            Маска shape (H, W), dtype uint8.
         """
         probs = self.predict_proba(image)
-        mask = np.argmax(probs, axis=0).astype(np.uint8)
-        return mask
+        return np.argmax(probs, axis=0).astype(np.uint8)
+
+    def predict_rgb(self, image: np.ndarray) -> np.ndarray:
+        """
+        Получение цветной RGB-маски для визуализации.
+
+        Returns:
+            RGB-изображение shape (H, W, 3), dtype uint8.
+        """
+        mask = self.predict(image)
+        h, w = mask.shape
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for cls_idx, color in CLASS_COLORS.items():
+            rgb[mask == cls_idx] = color
+        return rgb
 
     def predict_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
-        """
-        Пакетная обработка списка изображений.
-        """
+        """Пакетный инференс для списка изображений."""
         return [self.predict(img) for img in images]
 
-    def get_class_names(self) -> Dict[int, str]:
-        """
-        Получение словаря имен классов.
-        """
+    @staticmethod
+    def get_class_names() -> Dict[int, str]:
+        """Словарь названий классов."""
         return TARGET_CLASS_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Пример вызова в стороннем скрипте
+# ---------------------------------------------------------------------------
+# if __name__ == "__main__":
+#     # 1. Инициализация модели
+#     model = SegmentationModel()
+#
+#     # 2. Пример прогона тестового массива (например, изображение 1024x1024)
+#     dummy_image = np.random.randint(0, 256, (1024, 1024, 3), dtype=np.uint8)
+#
+#     # 3. Получение маски классов (0..5)
+#     mask = model.predict(dummy_image)
+#     print("Форма маски:", mask.shape, "| Уникальные классы:", np.unique(mask))
+#
+#     # 4. Получение цветной маски
+#     color_mask = model.predict_rgb(dummy_image)
+#     print("Форма цветной визуализации:", color_mask.shape)

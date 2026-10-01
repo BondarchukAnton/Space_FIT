@@ -54,7 +54,7 @@ def save_checkpoints(epoch, model_state_dict, optimizer_state_dict, mean_loss, e
     }, model_dst)
 
 
-BATCH_SIZE = 8  # RTX 5090 (32GB) with MaxViT encoder
+BATCH_SIZE = 9  # RTX 5090 (32GB) with MaxViT encoder
 ACCUMULATION_STEPS = 2  # Effective batch size = 16
 WRITER_EPOCH = 1
 start_epoch = 1
@@ -63,7 +63,7 @@ resolution = 512
 LABEL = 'UnetPP_maxvit_6cls_512'
 
 # ---- Параметры дообучения / возобновления обучения ----
-PRETRAINED_PATH = None       # Путь к чекпоинту предобученной модели (None — обучение без чекпоинта)
+PRETRAINED_PATH = '/mnt/980EAB530EAB2968/hdd_logs/OtherProject/SPACE/UnetPP_maxvit_7cls_512/00015.pt'       # Путь к чекпоинту предобученной модели (None — обучение без чекпоинта)
 SAME_NUM_CLASSES = False     # True — одинаковое число классов (полная загрузка модели),
                              # False — разное число классов (загрузка весов только в общие слои до слоя классификации)
 RESUME_TRAINING = False      # True — продолжить обучение (восстановить оптимизатор, планировщик и эпоху),
