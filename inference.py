@@ -4,6 +4,7 @@ from typing import List, Dict, Optional, Union, Tuple
 import numpy as np
 import torch
 import segmentation_models_pytorch as smp
+from elevation_segmentation.inference import ElevationPredictor
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -34,10 +35,20 @@ CLASS_COLORS: Dict[int, Tuple[int, int, int]] = {
 }
 
 
+# Индекс класса «Горный район» в выходном тензоре основной модели
+MOUNTAIN_CLASS_INDEX = 5
+
+
 class SegmentationModel:
     """
     Автономный класс для выполнения инференса модели сегментации.
     Не требует сторонних модулей проекта и подключения к интернету.
+
+    Опционально интегрирует модель сегментации возвышенностей (ElevationPredictor):
+    перед аргмакс её вероятностная карта (float32 H×W) умножается на
+    elevation_weight и прибавляется к каналу «Горный район» (индекс
+    MOUNTAIN_CLASS_INDEX), корректируя финальную маску в пользу горного класса
+    там, где рельеф высокий.
     """
 
     def __init__(
@@ -47,6 +58,8 @@ class SegmentationModel:
             num_classes: int = NUM_TARGET_CLASSES,
             tile_size: int = 512,
             overlap: int = 64,
+            elevation_checkpoint: Optional[str] = None,
+            elevation_weight: float = 1.0,
     ) -> None:
         """
         Инициализация и загрузка весов.
@@ -57,6 +70,11 @@ class SegmentationModel:
             num_classes: Количество выходных классов.
             tile_size: Размер окна тайлинга (по умолчанию 512).
             overlap: Перекрытие между соседними окнами.
+            elevation_checkpoint: Путь к чекпоинту ElevationPredictor (.pt).
+                Если None — коррекция по возвышенностям не применяется.
+            elevation_weight: Коэффициент масштабирования вклада elevation-карты
+                при добавлении к каналу «Горный район» перед argmax.
+                По умолчанию 1.0 (без масштабирования).
         """
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -66,6 +84,7 @@ class SegmentationModel:
         self.num_classes = num_classes
         self.tile_size = tile_size
         self.overlap = overlap
+        self.elevation_weight = elevation_weight
 
         if not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(f"Файл весов не найден по пути: {checkpoint_path}")
@@ -100,6 +119,22 @@ class SegmentationModel:
             self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
         logger.info(f"Модель успешно загружена из {checkpoint_path} на устройство {self.device}")
+
+        # Инициализация elevation-модели (опционально)
+        self.elevation_predictor: Optional[ElevationPredictor] = None
+        if elevation_checkpoint is not None:
+            if not os.path.isfile(elevation_checkpoint):
+                raise FileNotFoundError(
+                    f"Файл весов elevation-модели не найден: {elevation_checkpoint}"
+                )
+            self.elevation_predictor = ElevationPredictor(
+                checkpoint=elevation_checkpoint,
+                device=str(self.device),
+            )
+            logger.info(
+                f"Elevation-модель загружена из {elevation_checkpoint} "
+                f"(weight={elevation_weight})"
+            )
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
         """
@@ -137,9 +172,31 @@ class SegmentationModel:
             steps.append(length - tile)
         return steps
 
+    def _apply_elevation_correction(self, probs: np.ndarray, image_rgb: np.ndarray) -> np.ndarray:
+        """
+        Прибавляет взвешенную карту вероятностей возвышенностей к каналу
+        «Горный район» (MOUNTAIN_CLASS_INDEX) в массиве вероятностей.
+
+        Args:
+            probs: Карта вероятностей (num_classes, H, W) float32 после тайлинга.
+            image_rgb: Исходное RGB-изображение (H, W, 3) uint8, передаётся в
+                ElevationPredictor напрямую (без предобработки основной модели).
+
+        Returns:
+            Скорректированный массив вероятностей той же формы и dtype.
+        """
+        elevation_proba = self.elevation_predictor.predict_proba(image_rgb)  # float32 (H, W)
+        probs = probs.copy()
+        probs[MOUNTAIN_CLASS_INDEX] += elevation_proba * self.elevation_weight
+        return probs
+
     def predict_proba(self, image: np.ndarray) -> np.ndarray:
         """
         Предсказание карты вероятностей классов для изображения произвольного размера.
+
+        Если была инициализирована elevation-модель, вероятностная карта
+        возвышенностей (умноженная на elevation_weight) прибавляется к каналу
+        «Горный район» перед возвратом результата.
 
         Args:
             image: массив (H, W, 3) или (3, H, W) в RGB.
@@ -180,7 +237,17 @@ class SegmentationModel:
                     weight_map[:, y:y + self.tile_size, x:x + self.tile_size] += 1.0
 
         probs /= weight_map
-        return probs[:, :h, :w]
+        probs = probs[:, :h, :w]
+
+        # Коррекция по возвышенностям: прибавляем elevation-вероятность к каналу гор
+        if self.elevation_predictor is not None:
+            # Восстанавливаем исходный RGB uint8 для ElevationPredictor
+            image_rgb = image if image.ndim == 3 and image.shape[2] == 3 else np.transpose(image, (1, 2, 0))
+            if image_rgb.dtype != np.uint8:
+                image_rgb = np.clip(image_rgb * 255, 0, 255).astype(np.uint8)
+            probs = self._apply_elevation_correction(probs, image_rgb)
+
+        return probs
 
     def predict(self, image: np.ndarray) -> np.ndarray:
         """

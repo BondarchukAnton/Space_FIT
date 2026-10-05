@@ -1,0 +1,8 @@
+# PyTorch и torchvision устанавливайте для своей CUDA по https://pytorch.org/get-started/locally/
+torch>=2.3,<3
+torchvision>=0.18,<1
+segmentation-models-pytorch==0.5.0
+numpy>=1.26,<3
+Pillow>=10,<13
+tqdm>=4.66,<5
+tensorboard>=2.16,<3
