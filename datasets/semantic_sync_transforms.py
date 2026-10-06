@@ -374,10 +374,11 @@ class TrickyResize_UpDwn():
 
 
 class SyncRotate360_plus():
-    def __init__(self, p=0.8, p_c=0.7, resolution=512):
+    def __init__(self, p=0.8, p_c=0.7, resolution=512, fill_mask=0, mask_fill=None):
         self.p = p
         self.p_c = p_c
         self.resolution = resolution
+        self.fill_mask = fill_mask if mask_fill is None else mask_fill
 
     @staticmethod
     def _crop(X1, Y1, resolution_x, resolution_y, img_fc, mask_fc):
@@ -403,7 +404,7 @@ class SyncRotate360_plus():
             else:
                 expand = False
             img_r = F.rotate(img, -angle, resample, expand, None, list(np.zeros(len(img.getbands()))))
-            mask_r = F.rotate(mask, -angle, IMode.NEAREST, expand, None, [0] * len(mask.getbands()))
+            mask_r = F.rotate(mask, -angle, IMode.NEAREST, expand, None, [self.fill_mask] * len(mask.getbands()))
 
             if expand:
                 w, h = img_r.size
@@ -419,8 +420,9 @@ class SyncRotate360_plus():
                     delt_sz1 = (((w * 142) / 100) - w) // 2
                     delt_sz2 = (((h * 142) / 100) - h) // 2
                     pad_img = T.Pad(padding=(int(delt_sz1), int(delt_sz2)), fill=0)
+                    pad_mask = T.Pad(padding=(int(delt_sz1), int(delt_sz2)), fill=self.fill_mask)
                     img_r = pad_img(img_r)
-                    mask_r = pad_img(mask_r)
+                    mask_r = pad_mask(mask_r)
                     w, h = img_r.size
                 X1, Y1 = np.random.randint(0, w - resolution_x), np.random.randint(0, h - resolution_y)
                 img_r, mask_r = self._crop(X1, Y1, resolution_x, resolution_y, img_r, mask_r)
@@ -439,8 +441,9 @@ class SyncRotate360_plus():
             delt_sz1 = (((w * 142) / 100) - w) // 2
             delt_sz2 = (((h * 142) / 100) - h) // 2
             pad_img = T.Pad(padding=(int(delt_sz1), int(delt_sz2)), fill=0)
+            pad_mask = T.Pad(padding=(int(delt_sz1), int(delt_sz2)), fill=self.fill_mask)
             img_r = pad_img(img)
-            mask_r = pad_img(mask)
+            mask_r = pad_mask(mask)
             X1, Y1 = np.random.randint(0, w - resolution_x), np.random.randint(0, h - resolution_y)
             img_r, mask_r = self._crop(X1, Y1, resolution_x, resolution_y, img_r, mask_r)
             return img_r, mask_r
@@ -548,28 +551,42 @@ class RandomNoiseSP:
     def __call__(self, img, mask, **kwargs):
         if np.random.rand() < self.p:
             amount = np.random.randint(0, 11) / 1000
-            salt_img = torch.tensor(random_noise(img, mode='salt', amount=amount))
+            rng = np.random.default_rng(random.randint(0, 2**31 - 1))
+            salt_img = torch.tensor(random_noise(img, mode='salt', amount=amount, rng=rng), dtype=torch.float32)
             return salt_img, mask
         elif np.random.rand() < self.p:
             amount = np.random.randint(0, 11) / 1000
-            salt_img = torch.tensor(random_noise(img, mode='pepper', amount=amount))
+            rng = np.random.default_rng(random.randint(0, 2**31 - 1))
+            salt_img = torch.tensor(random_noise(img, mode='pepper', amount=amount, rng=rng), dtype=torch.float32)
             return salt_img, mask
         elif np.random.rand() < self.p:
             amount = np.random.randint(0, 11) / 1000
-            salt_img = torch.tensor(random_noise(img, mode='s&p', amount=amount))
+            rng = np.random.default_rng(random.randint(0, 2**31 - 1))
+            salt_img = torch.tensor(random_noise(img, mode='s&p', amount=amount, rng=rng), dtype=torch.float32)
             return salt_img, mask
         return img, mask
 
 
 class RandomGridDistortion:
-    def __init__(self, p=0.3):
+    def __init__(self, p=0.3, fill_mask=0, mask_fill=None):
         self.p = p
+        self.fill_mask = fill_mask if mask_fill is None else mask_fill
 
     def __call__(self, img, mask, **kwargs):
         if np.random.rand() < self.p:
             image = np.array(img)
             mask = np.array(mask)
-            aug = A.GridDistortion(num_steps=np.random.randint(2,6), distort_limit=(-0.3, 0.3), normalized=(np.random.rand() < 0.5), p=1)
+            aug = A.GridDistortion(
+                num_steps=np.random.randint(2, 6),
+                distort_limit=(-0.3, 0.3),
+                normalized=(np.random.rand() < 0.5),
+                border_mode=cv2.BORDER_CONSTANT,
+                mask_interpolation=cv2.INTER_NEAREST,
+                fill=0,
+                fill_mask=self.fill_mask,
+                p=1,
+            )
+            aug.set_random_seed(random.randint(0, 2**31 - 1))
             augmented = aug(image=image, mask=mask)
             image = Image.fromarray(augmented['image'])
             mask = Image.fromarray(augmented['mask'])
@@ -579,14 +596,25 @@ class RandomGridDistortion:
 
 
 class RandomElasticTransform:
-    def __init__(self, p=0.2):
+    def __init__(self, p=0.2, fill_mask=0, mask_fill=None):
         self.p = p
+        self.fill_mask = fill_mask if mask_fill is None else mask_fill
 
     def __call__(self, img, mask, **kwargs):
         if np.random.rand() < self.p:
             image = np.array(img)
             mask = np.array(mask)
-            aug = A.ElasticTransform(p=1, alpha=np.random.randint(5,16), sigma=50, approximate=False)
+            aug = A.ElasticTransform(
+                p=1,
+                alpha=np.random.randint(5, 16),
+                sigma=50,
+                approximate=False,
+                border_mode=cv2.BORDER_CONSTANT,
+                mask_interpolation=cv2.INTER_NEAREST,
+                fill=0,
+                fill_mask=self.fill_mask,
+            )
+            aug.set_random_seed(random.randint(0, 2**31 - 1))
             augmented = aug(image=image, mask=mask)
             image = Image.fromarray(augmented['image'])
             mask = Image.fromarray(augmented['mask'])
@@ -677,7 +705,9 @@ class AffineAugmentation:
             rotate=(0,0),
             scale=(0.9, 1.1),
             translate_percent=(-0.1, 0.1),
-            shear=(-10, 10)
+            shear=(-10, 10),
+            fill_mask=0,
+            mask_fill=None,
     ):
         """
         Args:
@@ -687,7 +717,18 @@ class AffineAugmentation:
             pad_border_mode/pad_value: чем заполнять области, появившиеся после трансформации.
             affine_params: rotate=(-15,15), scale=(0.9,1.1), translate_percent=(-0.1,0.1), shear=(-10,10)
         """
-        self.affine = A.Affine(p=p_affine, rotate=rotate, scale=scale, translate_percent=translate_percent, shear=shear)
+        self.fill_mask = fill_mask if mask_fill is None else mask_fill
+        self.affine = A.Affine(
+            p=p_affine,
+            rotate=rotate,
+            scale=scale,
+            translate_percent=translate_percent,
+            shear=shear,
+            border_mode=pad_border_mode,
+            fill=pad_value,
+            fill_mask=self.fill_mask,
+            mask_interpolation=cv2.INTER_NEAREST,
+        )
         self.pad_to_original = pad_to_original
         self.pad_border_mode = pad_border_mode
         self.pad_value = pad_value
@@ -719,7 +760,7 @@ class AffineAugmentation:
                     min_width=w0,
                     border_mode=self.pad_border_mode,
                     fill=self.pad_value,  # чем заполнять "новые" пиксели изображения при BORDER_CONSTANT
-                    fill_mask=0,  # чем заполнять "новые" пиксели масок (фон)
+                    fill_mask=self.fill_mask,  # чем заполнять "новые" пиксели масок
                     p=1.0,
                 ),
                 A.CenterCrop(height=h0, width=w0, p=1.0),
@@ -730,6 +771,7 @@ class AffineAugmentation:
             # Глобально задаём nearest для масок в геометрии [page:2][page:1]
             mask_interpolation=cv2.INTER_NEAREST,
         )
+        pipeline.set_random_seed(random.randint(0, 2**31 - 1))
 
         res = pipeline(image=img_np, masks=masks_list)
         img_aug = res["image"]

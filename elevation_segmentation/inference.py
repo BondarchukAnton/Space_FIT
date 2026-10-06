@@ -5,8 +5,16 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
-from .model import create_model, normalize, MEAN, STD
-from .utils import setup_logging
+if __package__ is None or __package__ == "":
+    import sys
+    _project_root = Path(__file__).resolve().parents[1]
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+    from elevation_segmentation.model import create_model, normalize, MEAN, STD
+    from elevation_segmentation.utils import setup_logging
+else:
+    from .model import create_model, normalize, MEAN, STD
+    from .utils import setup_logging
 
 LOG = logging.getLogger(__name__)
 

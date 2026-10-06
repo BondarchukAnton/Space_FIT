@@ -3,8 +3,17 @@ import argparse
 import logging
 import numpy as np
 from PIL import Image
-from .inference import ElevationPredictor
-from .utils import setup_logging
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+    _project_root = Path(__file__).resolve().parents[1]
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+    from elevation_segmentation.inference import ElevationPredictor
+    from elevation_segmentation.utils import setup_logging
+else:
+    from .inference import ElevationPredictor
+    from .utils import setup_logging
 
 
 def main():

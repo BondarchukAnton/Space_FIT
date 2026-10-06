@@ -2,10 +2,32 @@
 import hashlib
 import json
 from pathlib import Path
+import random
+import sys
 import numpy as np
-from PIL import Image, ImageEnhance
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
+
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from datasets.dataset import n_e_augs_shuffle
+from datasets.semantic_sync_transforms import (
+    SyncCompose,
+    SyncRandomBrightnessContrastTarget,
+    SyncRandomHorizontalFlip,
+    SyncRandomVerticalFlip,
+    SyncRotate360_plus,
+    RandomGridDistortion,
+    RandomElasticTransform,
+    TrickyResize_UpDwn,
+    AffineAugmentation,
+    SyncResize,
+    SyncToTensor,
+    RandomNoiseSP,
+)
 
 
 def read_rgb(path):
@@ -86,43 +108,97 @@ def inspect_dataset(records):
 
 class ElevationDataset(Dataset):
     """Создаёт квадратные вырезки с синхронными преобразованиями RGB и маски."""
-    def __init__(self, records, config):
-        self.records = records; self.config = config; self.epoch = 0
+    def __init__(self, records, config, is_train=True):
+        self.records = records
+        self.config = config
+        self.epoch = 0
+        self.is_train = is_train
+
+        crop_size = config['crop_size']
+        if self.is_train:
+            s_rbct = SyncRandomBrightnessContrastTarget()
+            sync_hor = SyncRandomHorizontalFlip()
+            sync_v = SyncRandomVerticalFlip()
+            syns_rp = SyncRotate360_plus(resolution=crop_size, fill_mask=255)
+            rgd = RandomGridDistortion(fill_mask=255)
+            ret = RandomElasticTransform(fill_mask=255)
+            rs_up_dwn = TrickyResize_UpDwn(resolution=crop_size, minmax_size_up=[117, 200])
+            aa = AffineAugmentation(p=0.75, translate_percent=(-0.5, 0.5), scale=(0.7, 1.1), fill_mask=255)
+            sync_rs = SyncResize(crop_size)
+            sync_totensor = SyncToTensor()
+            rn = RandomNoiseSP()
+
+            self.transforms = [
+                s_rbct,
+                sync_hor,
+                sync_v,
+                syns_rp,
+                rgd,
+                ret,
+                rs_up_dwn,
+                aa,
+                sync_rs,
+                sync_totensor,
+                rn,
+            ]
+        else:
+            self.transforms = [
+                SyncResize(crop_size),
+                SyncToTensor(),
+            ]
 
     def __len__(self):
         return len(self.records) * self.config['crops_per_image']
 
     def __getitem__(self, index):
-        cfg = self.config; row = self.records[index % len(self.records)]
-        rng = np.random.default_rng(np.random.SeedSequence([cfg['seed'], self.epoch, index]))
-        image = read_rgb(row['image']); mask = read_mask(row['mask']); size = cfg['crop_size']
+        cfg = self.config
+        row = self.records[index % len(self.records)]
+
+        item_seed = int(np.random.SeedSequence([cfg['seed'], self.epoch, index]).generate_state(1)[0])
+        random.seed(item_seed)
+        np.random.seed(item_seed)
+        torch.manual_seed(item_seed)
+        rng = np.random.default_rng(item_seed)
+
+        image = read_rgb(row['image'])
+        mask = read_mask(row['mask'])
+        size = cfg['crop_size']
         h, w = mask.shape
-        dh, dw = max(0, size-h), max(0, size-w)
-        padding = ((dh//2, dh-dh//2), (dw//2, dw-dw//2))
-        image = np.pad(image, (*padding, (0,0)), mode='edge')
+        dh, dw = max(0, size - h), max(0, size - w)
+        padding = ((dh // 2, dh - dh // 2), (dw // 2, dw - dw // 2))
+        image = np.pad(image, (*padding, (0, 0)), mode='edge')
         mask = np.pad(mask, padding, mode='constant', constant_values=255)
-        h,w = mask.shape
+        h, w = mask.shape
+
         points = np.argwhere(mask == 1) if rng.random() < cfg['positive_crop_probability'] else []
         selected = None
         for attempt in range(12):
             if len(points):
-                py,px = points[rng.integers(len(points))]
-                y = int(rng.integers(max(0,py-size+1), min(py,h-size)+1))
-                x = int(rng.integers(max(0,px-size+1), min(px,w-size)+1))
+                py, px = points[rng.integers(len(points))]
+                y = int(rng.integers(max(0, py - size + 1), min(py, h - size) + 1))
+                x = int(rng.integers(max(0, px - size + 1), min(px, w - size) + 1))
             else:
-                y = int(rng.integers(h-size+1)); x = int(rng.integers(w-size+1))
-            if (mask[y:y+size,x:x+size] != 255).any():
-                selected = (y,x); break
+                y = int(rng.integers(h - size + 1))
+                x = int(rng.integers(w - size + 1))
+            if (mask[y:y + size, x:x + size] != 255).any():
+                selected = (y, x)
+                break
         if selected is None:
-            py,px = np.argwhere(mask != 255)[0]
-            selected = (min(max(int(py)-size//2,0),h-size), min(max(int(px)-size//2,0),w-size))
-        y,x = selected
-        image = image[y:y+size,x:x+size]; mask = mask[y:y+size,x:x+size]
-        rotation = int(rng.integers(4)); image = np.rot90(image,rotation); mask = np.rot90(mask,rotation)
-        if rng.random() < .5:
-            image = np.fliplr(image); mask = np.fliplr(mask)
-        pil = Image.fromarray(np.ascontiguousarray(image))
-        pil = ImageEnhance.Brightness(pil).enhance(float(rng.uniform(.9,1.1)))
-        pil = ImageEnhance.Contrast(pil).enhance(float(rng.uniform(.9,1.1)))
-        image = np.array(pil,dtype=np.float32)/255.
-        return torch.from_numpy(image.transpose(2,0,1).copy()), torch.from_numpy(mask.copy()).long()
+            py, px = np.argwhere(mask != 255)[0]
+            selected = (min(max(int(py) - size // 2, 0), h - size), min(max(int(px) - size // 2, 0), w - size))
+        y, x = selected
+        image = image[y:y + size, x:x + size]
+        mask = mask[y:y + size, x:x + size]
+
+        image_pil = Image.fromarray(np.ascontiguousarray(image))
+        mask_pil = Image.fromarray(np.ascontiguousarray(mask), mode='L')
+
+        if self.is_train:
+            shuffled_transforms = n_e_augs_shuffle(self.transforms, n=-3)
+            pipeline = SyncCompose(shuffled_transforms)
+            image_out, mask_out = pipeline(image_pil, mask_pil)
+        else:
+            pipeline = SyncCompose(self.transforms)
+            image_out, mask_out = pipeline(image_pil, mask_pil)
+
+        return image_out.float(), mask_out.long()

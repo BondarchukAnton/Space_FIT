@@ -9,7 +9,7 @@
   "positive_crop_probability": 0.85,
   "batch_size": 16,
   "accumulation_steps": 4,
-  "epochs": 1000,
+  "epochs": 100,
   "encoder_lr": 3e-05,
   "decoder_lr": 0.0003,
   "weight_decay": 0.0001,
@@ -33,5 +33,14 @@
     0.229,
     0.224,
     0.225
-  ]
+  ],
+  "pretrained_path": "runs/elevation_resnet34_512/best.pt",
+  "same_num_classes": true,
+  "resume_training": false,
+  "scheduler": "onecycle",
+  "encoder_max_lr": 0.00001,
+  "decoder_max_lr": 0.0001,
+  "onecycle_pct_start": 0.1,
+  "onecycle_div_factor": 10.0,
+  "onecycle_final_div_factor": 10000.0
 }

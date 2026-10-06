@@ -37,7 +37,7 @@ def fixture(root):
     (root/'manifest.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
     cfg=json.loads(Path(__file__).with_name('config.json').read_text())
     cfg.update(dataset_root=str(root),crop_size=64,tile_size=64,overlap=16,epochs=2,
-               crops_per_image=1,num_workers=0,accumulation_steps=2,save_every_steps=1,
+               crops_per_image=1,batch_size=1,freeze_batchnorm=True,num_workers=0,accumulation_steps=2,save_every_steps=1,
                encoder_weights=None,device='cpu',amp=False)
     return cfg
 
@@ -124,4 +124,118 @@ class ModuleTests(unittest.TestCase):
                 torch.testing.assert_close(a['model_state_dict'][key],b['model_state_dict'][key],rtol=0,atol=0)
 
 
-if __name__=='__main__':unittest.main()
+    def test_weights_loading_with_and_without_head(self):
+        class DummyModel(nn.Module):
+            def __init__(self, out_channels=1):
+                super().__init__()
+                self.encoder = nn.Conv2d(3, 8, 3, padding=1)
+                self.decoder = nn.Conv2d(8, 4, 3, padding=1)
+                self.segmentation_head = nn.Conv2d(4, out_channels, 1)
+
+        source_model = DummyModel(out_channels=1)
+        # Устанавливаем различные веса
+        with torch.no_grad():
+            source_model.encoder.weight.fill_(1.5)
+            source_model.decoder.weight.fill_(2.5)
+            source_model.segmentation_head.weight.fill_(3.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt_path = Path(tmp) / 'source.pt'
+            torch.save({'model_state_dict': source_model.state_dict()}, ckpt_path)
+
+            # 1. Загрузка со всей головой (same_num_classes=True)
+            target1 = DummyModel(out_channels=1)
+            train.initialize_weights(target1, str(ckpt_path), same_num_classes=True)
+            torch.testing.assert_close(target1.encoder.weight, source_model.encoder.weight)
+            torch.testing.assert_close(target1.segmentation_head.weight, source_model.segmentation_head.weight)
+
+            # 2. Загрузка без головы (same_num_classes=False)
+            target2 = DummyModel(out_channels=1)
+            with torch.no_grad():
+                target2.segmentation_head.weight.fill_(0.0)
+            train.initialize_weights(target2, str(ckpt_path), same_num_classes=False)
+            torch.testing.assert_close(target2.encoder.weight, source_model.encoder.weight)
+            torch.testing.assert_close(target2.decoder.weight, source_model.decoder.weight)
+            # Голова осталась прежней (0.0), а не 3.5 из source_model
+            self.assertEqual(float(target2.segmentation_head.weight[0, 0, 0, 0]), 0.0)
+
+            # 3. Несовместимые конфигурации дают понятные ошибки
+            invalid_cfg1 = {'resume_training': True, 'pretrained_path': None, 'same_num_classes': True}
+            with self.assertRaises(ValueError):
+                train.validate_config({**fixture(Path(tmp)), **invalid_cfg1})
+
+            invalid_cfg2 = {'resume_training': True, 'pretrained_path': str(ckpt_path), 'same_num_classes': False}
+            with self.assertRaises(ValueError):
+                train.validate_config({**fixture(Path(tmp)), **invalid_cfg2})
+
+    def test_resume_with_old_reducelronplateau_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = fixture(root)
+            ckpt_path = root / 'old_plateau.pt'
+            rows = load_records(root)
+            _, fingerprint = inspect_dataset(rows)
+            model = TinyModel()
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            torch.save({
+                'format_version': 1,
+                'config': fixture(root),
+                'dataset_fingerprint': fingerprint,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(),
+                'scheduler': {'mode': 'max', 'patience': 5},
+                'scheduler_type': 'ReduceLROnPlateau',
+                'epoch': 1,
+                'next_batch': 0,
+                'global_step': 1,
+                'best_iou': 0.5,
+                'loss_sum': 1.0,
+                'loss_batches': 1
+            }, ckpt_path)
+
+            # При resume_training=True должна быть понятная ошибка
+            cfg_resume = fixture(root)
+            cfg_resume.update(pretrained_path=str(ckpt_path), resume_training=True, same_num_classes=True)
+            cfg_path = root / 'config.json'
+            cfg_path.write_text(json.dumps(cfg_resume))
+            with patch.object(train, 'create_model', side_effect=lambda *a, **kw: TinyModel()):
+                with patch.object(sys, 'argv', ['train', '--config', str(cfg_path)]):
+                    with self.assertRaises(ValueError) as ctx:
+                        train.main()
+                    self.assertIn('ReduceLROnPlateau', str(ctx.exception))
+
+    def test_augmentations_mask_values_and_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = fixture(root)
+            cfg['crop_size'] = 128
+            rows = load_records(root)
+            dataset = ElevationDataset(rows['train'], cfg, is_train=True)
+            for idx in range(min(5, len(dataset))):
+                img, mask = dataset[idx]
+                self.assertEqual(img.shape, (3, 128, 128))
+                self.assertEqual(mask.shape, (128, 128))
+                self.assertEqual(img.dtype, torch.float32)
+                self.assertEqual(mask.dtype, torch.int64)
+                self.assertTrue(0.0 <= img.min() and img.max() <= 1.0)
+                mask_unique = set(torch.unique(mask).tolist())
+                self.assertTrue(mask_unique.issubset({0, 1, 255}))
+
+    def test_onecycle_and_none_scheduler_progression(self):
+        model = nn.Linear(4, 2)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=1e-3, total_steps=10, pct_start=0.3, div_factor=10.0, final_div_factor=100.0
+        )
+        lrs = []
+        for _ in range(10):
+            lrs.append(opt.param_groups[0]['lr'])
+            sched.step()
+        # В OneCycleLR скорость обучения сначала растет, затем убывает
+        self.assertLess(lrs[0], lrs[3])
+        self.assertGreater(lrs[3], lrs[-1])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
