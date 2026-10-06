@@ -1,6 +1,6 @@
 {
   "dataset_root": "/home/user/PycharmProjects/DopProjects/Elevation_dataset_space/dataset_250",
-  "output_dir": "runs/elevation_resnet34_512",
+  "output_dir": "runs/elevation_resnet34_512_v2",
   "architecture": "DeepLabV3Plus",
   "encoder_name": "resnet34",
   "encoder_weights": "imagenet",
